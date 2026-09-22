@@ -43,6 +43,8 @@ from pyrit.scenario.garak import (
     Doctor,
     Encoding,
     EncodingTechnique,
+    Exploitation,
+    ExploitationTechnique,
     FigStep,
     PackageHallucination,
     PackageHallucinationTechnique,
@@ -185,6 +187,45 @@ web_injection_result = await web_injection_scenario.run_async()  # type: ignore
 
 # %%
 await output_scenario_async(web_injection_result)
+
+# %% [markdown]
+# ## Exploitation
+#
+# Ports Garak's active `JinjaTemplatePythonInjection` and `SQLInjectionEcho` families.
+# Payloads and the reusable echo wrapper live in local datasets; the scenario only assembles
+# bounded single-turn attacks. Each payload gets a dedicated `SubStringScorer`, so a positive
+# result means the model emitted the expected exploit material. It does **not** establish that
+# a downstream template engine or SQL database executed it.
+#
+# **CLI examples:**
+#
+# ```bash
+# pyrit_scan run garak.exploitation --target openai_chat --techniques jinja_template_python_injection --max-dataset-size 2
+# pyrit_scan run garak.exploitation --target openai_chat --techniques sql_injection_echo --max-dataset-size 2
+# ```
+#
+# **Available techniques:** `JinjaTemplatePythonInjection`, `SQLInjectionEcho`.
+# `DEFAULT` and `ALL` select both. The scenario disables the generic baseline because
+# exploit success is payload-specific.
+
+# %%
+exploitation_scenario = Exploitation(max_payloads_per_technique=2)
+exploitation_scenario.set_params_from_args(  # type: ignore
+    args={
+        "objective_target": objective_target,
+        "scenario_techniques": [ExploitationTechnique.DEFAULT],
+    }
+)
+await exploitation_scenario.initialize_async()  # type: ignore
+
+print(f"Scenario: {exploitation_scenario.name}")
+print(f"Atomic attacks: {exploitation_scenario.atomic_attack_count}")
+
+# %%
+exploitation_result = await exploitation_scenario.run_async()  # type: ignore
+
+# %%
+await output_scenario_async(exploitation_result)
 
 # %% [markdown]
 # ## ApiKey
