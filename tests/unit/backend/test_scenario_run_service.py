@@ -1409,7 +1409,8 @@ class TestScenarioRunServiceGetRun:
                         ScenarioRunPlanAtomicGroup(
                             id="group-1",
                             atomic_attack_name="legacy attack",
-                            display_group="Attack",
+                            display_group="AUDIT_SAFE_MARKER",
+                            technique_name="ignore_print",
                             technique_eval_hash="eval",
                             seed_group_ids=["seed-1"],
                         )
@@ -1465,7 +1466,7 @@ class TestScenarioRunServiceGetRun:
         assert fetched.total_attacks == expected_total
         assert fetched.completed_attacks == 1
         assert fetched.planned_total_available is expected_planned_total
-        assert fetched.techniques_used == (["Attack"] if expected_planned_total else ["legacy attack"])
+        assert fetched.techniques_used == (["ignore_print"] if expected_planned_total else ["legacy attack"])
         assert ("using legacy run detail fields" in caplog.text) is expected_warning
 
     def test_get_run_falls_back_to_persisted_error(self, mock_memory) -> None:

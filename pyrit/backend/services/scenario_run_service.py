@@ -1201,7 +1201,7 @@ class ScenarioRunService:
             )
         )
         techniques_used = (
-            list(dict.fromkeys(group.display_group for group in plan.atomic_groups))
+            list(dict.fromkeys(group.technique_name for group in plan.atomic_groups if group.technique_name is not None))
             if plan is not None
             else scenario_result.get_techniques_used()
         )
