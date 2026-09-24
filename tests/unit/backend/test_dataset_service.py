@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pyrit.backend.services.dataset_service import DatasetService, get_dataset_service
-from pyrit.memory.memory_interface import SeedDatasetSummary
+from pyrit.models import SeedDatasetSummary
 
 
 @pytest.fixture

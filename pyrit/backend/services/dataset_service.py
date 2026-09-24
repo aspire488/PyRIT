@@ -17,7 +17,7 @@ from pyrit.backend.models.datasets import (
 )
 from pyrit.datasets import SeedDatasetProvider
 from pyrit.memory import CentralMemory
-from pyrit.memory.memory_interface import SeedDatasetSummary
+from pyrit.models import SeedDatasetSummary
 
 logger = logging.getLogger(__name__)
 

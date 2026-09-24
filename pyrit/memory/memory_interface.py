@@ -93,6 +93,7 @@ from pyrit.models import (
     ScoreStatus,
     Seed,
     SeedDataset,
+    SeedDatasetSummary,
     SeedGroup,
     SeedIdentifier,
     SeedType,
@@ -331,19 +332,6 @@ class _AttackResultQuery:
                 )
                 object.__setattr__(self, field_name, legacy_values)
             object.__setattr__(self, "labels", MappingProxyType(labels) if labels else None)
-
-
-@dataclass(frozen=True, slots=True)
-class SeedDatasetSummary:
-    """Database-side summary of seeds belonging to one dataset."""
-
-    dataset_name: str | None
-    logical_examples: int
-    seed_pieces: int
-    objectives: int
-    modalities: tuple[str, ...]
-    harm_categories: tuple[str, ...]
-    has_unlabeled_harm_categories: bool
 
 
 class MemoryInterface(abc.ABC):
@@ -3680,10 +3668,7 @@ class MemoryInterface(abc.ABC):
                 .subquery()
             )
             unnamed_metadata = (
-                select(SeedEntry.data_type, SeedEntry.harm_categories)
-                .where(unnamed_condition)
-                .distinct()
-                .subquery()
+                select(SeedEntry.data_type, SeedEntry.harm_categories).where(unnamed_condition).distinct().subquery()
             )
             unnamed_statement = select(
                 unnamed_aggregate.c.dataset_name,
@@ -3692,9 +3677,7 @@ class MemoryInterface(abc.ABC):
                 unnamed_aggregate.c.objectives,
                 unnamed_metadata.c.data_type,
                 unnamed_metadata.c.harm_categories,
-            ).select_from(
-                unnamed_aggregate.join(unnamed_metadata, literal(True))
-            )
+            ).select_from(unnamed_aggregate.join(unnamed_metadata, literal(True)))
 
             combined_statement = named_statement.union_all(unnamed_statement)
 
