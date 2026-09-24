@@ -4,7 +4,6 @@
 from unittest.mock import MagicMock, patch
 
 from pyrit.memory import MemoryInterface
-from pyrit.memory.memory_models import SeedEntry
 from pyrit.models import SeedPrompt
 
 
@@ -16,7 +15,9 @@ async def test_get_seed_dataset_summaries_avoids_metadata_row_multiplication(
         seeds=[
             SeedPrompt(value="prompt one", dataset_name="dataset", data_type="text", harm_categories=["harm"]),
             SeedPrompt(value="prompt two", dataset_name="dataset", data_type="reasoning", harm_categories=["harm"]),
-            SeedPrompt(value="https://example.com/three", dataset_name="dataset", data_type="url", harm_categories=["harm"]),
+            SeedPrompt(
+                value="https://example.com/three", dataset_name="dataset", data_type="url", harm_categories=["harm"]
+            ),
         ],
         added_by="tester",
     )
