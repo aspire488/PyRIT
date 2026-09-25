@@ -141,6 +141,45 @@ def test_validate_and_extract_harm_data_scores_only_assistant_message(mock_harm_
     assert mock_harm_scorer._memory.add_message_to_memory.call_count == 2
 
 
+def test_validate_and_extract_objective_data_scores_only_assistant_message(mock_objective_scorer):
+    conversation_id = "conversation"
+    user_message = Message(
+        message_pieces=[
+            MessagePiece(
+                role="user",
+                original_value="Test objective",
+                original_value_data_type="text",
+                conversation_id=conversation_id,
+                sequence=0,
+            )
+        ]
+    )
+    assistant_message = Message(
+        message_pieces=[
+            MessagePiece(
+                role="assistant",
+                original_value="Test response",
+                original_value_data_type="text",
+                conversation_id=conversation_id,
+                sequence=1,
+            )
+        ]
+    )
+    dataset = HumanLabeledDataset(
+        name="test_dataset",
+        metrics_type=MetricsType.OBJECTIVE,
+        entries=[ObjectiveHumanLabeledEntry([user_message, assistant_message], [True], "Test objective")],
+        version="1.0",
+    )
+
+    responses, human_scores, objectives = ObjectiveScorerEvaluator(mock_objective_scorer)._validate_and_extract_data(dataset)
+
+    assert responses == [assistant_message]
+    assert human_scores == [[1.0]]
+    assert objectives == ["Test objective"]
+    assert mock_objective_scorer._memory.add_message_to_memory.call_count == 2
+
+
 async def test_evaluate_dataset_async_objective(mock_objective_scorer):
     responses = [
         Message(message_pieces=[MessagePiece(role="assistant", original_value="test", original_value_data_type="text")])
