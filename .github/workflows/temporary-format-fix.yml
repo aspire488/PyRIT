@@ -1,0 +1,40 @@
+name: temporary-format-fix
+
+on:
+  push:
+    branches:
+      - fix/harmbench-context-string
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/harmbench-context-string
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Ruff
+        run: python -m pip install "ruff==0.16.8"
+      - name: Format changed Python files
+        run: ruff format pyrit/datasets/seed_datasets/remote/harmbench_dataset.py tests/unit/datasets/test_harmbench_dataset.py
+      - name: Commit formatting and remove temporary workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyrit/datasets/seed_datasets/remote/harmbench_dataset.py tests/unit/datasets/test_harmbench_dataset.py
+          if git diff --cached --quiet; then
+            echo "No formatting changes were produced."
+            git rm .github/workflows/temporary-format-fix.yml
+            git commit -m "chore: remove temporary formatting workflow"
+          else
+            git commit -m "style: apply ruff formatting"
+            git rm .github/workflows/temporary-format-fix.yml
+            git commit -m "chore: remove temporary formatting workflow"
+          fi
+          git push origin HEAD:fix/harmbench-context-string
