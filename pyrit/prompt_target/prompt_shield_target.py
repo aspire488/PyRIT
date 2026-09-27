@@ -254,6 +254,7 @@ class PromptShieldTarget(PromptTarget):
                         user_prompt += contents[0]
                     else:
                         documents.append(contents[0])
+                        user_prompt += contents[1]
 
                 return {"userPrompt": user_prompt, "documents": documents if documents else []}
 
