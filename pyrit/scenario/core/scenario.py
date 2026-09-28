@@ -41,6 +41,9 @@ from pyrit.models import (
     ScenarioRunPlanSeedPrompt,
     ScenarioRunSizeComponent,
     ScenarioRunSizeEstimate,
+    ScenarioRunSizeEstimateCondition,
+    ScenarioRunSizeEstimateStatus,
+    ScenarioRunSizeFactor,
     ScenarioRunState,
     config_hash,
 )
@@ -163,6 +166,7 @@ class Scenario(ABC):
         default_dataset_config: DatasetAttackConfiguration,
         objective_scorer: Scorer,
         scenario_result_id: uuid.UUID | str | None = None,
+        uses_default_adversarial_target: bool | None = None,
     ) -> None:
         """
         Initialize a scenario.
@@ -177,6 +181,9 @@ class Scenario(ABC):
             default_dataset_config (DatasetAttackConfiguration): The default dataset configuration used
                 when no ``dataset_config`` is passed to ``initialize_async``.
             objective_scorer (Scorer): The objective scorer used to evaluate attack results.
+            uses_default_adversarial_target (bool | None): Whether this scenario uses the shared
+                adversarial target. None derives usage from its registered technique factories.
+                Scenarios that build their own attacks or supply explicit targets declare this directly.
             scenario_result_id (uuid.UUID | str | None): Optional ID of an existing scenario result to resume.
                 Can be either a UUID object or a string representation of a UUID.
                 If provided and found in memory, the scenario will resume from prior progress.
@@ -205,6 +212,7 @@ class Scenario(ABC):
         self._technique_class = technique_class
         self._default_technique = technique_class.default()
         self._default_dataset_config = default_dataset_config
+        self._uses_default_adversarial_target = uses_default_adversarial_target
 
         # These will be set in initialize_async
         self._objective_target: PromptTarget | None = None
@@ -262,6 +270,21 @@ class Scenario(ABC):
     def atomic_attack_count(self) -> int:
         """The number of atomic attacks in this scenario."""
         return len(self._atomic_attacks)
+
+    @property
+    def uses_default_adversarial_target(self) -> bool:
+        """Whether any available technique uses the shared adversarial target."""
+        if self._uses_default_adversarial_target is not None:
+            return self._uses_default_adversarial_target
+
+        from pyrit.registry import AttackTechniqueRegistry
+
+        factories = AttackTechniqueRegistry.get_registry_singleton().get_factories()
+        return any(
+            factory.uses_default_adversarial_target
+            for technique in self._technique_class.get_all_techniques()
+            if (factory := factories.get(technique.value)) is not None
+        )
 
     @property
     def active_atomic_group_ids(self) -> frozenset[str]:
@@ -612,6 +635,9 @@ class Scenario(ABC):
                 ScenarioRunSizeComponent(
                     label="Baseline",
                     count=seed_group_count,
+                    factors=[
+                        ScenarioRunSizeFactor(label="selected logical seed groups", count=seed_group_count),
+                    ],
                     is_baseline=True,
                     note="One unmodified prompt-sending unit per selected seed group.",
                 )
@@ -637,10 +663,21 @@ class Scenario(ABC):
                 else:
                     estimated_attack_count = None
                     note += " The range covers every compatibility mix that the randomized per-dataset caps can select."
+        status = (
+            ScenarioRunSizeEstimateStatus.Exact
+            if estimated_attack_count is not None
+            else ScenarioRunSizeEstimateStatus.Conditional
+        )
         return ScenarioRunSizeEstimate(
-            estimated_attack_count=estimated_attack_count,
+            status=status,
+            total_attack_count=estimated_attack_count,
             minimum_attack_count=minimum_attack_count,
             maximum_attack_count=maximum_attack_count,
+            condition=(
+                ScenarioRunSizeEstimateCondition.LaunchConfiguration
+                if status is ScenarioRunSizeEstimateStatus.Conditional
+                else None
+            ),
             components=components,
             datasets=datasets,
             note=note,
@@ -664,6 +701,10 @@ class Scenario(ABC):
                 ScenarioRunSizeComponent(
                     label="Default technique sweep",
                     count=seed_group_count * technique_count,
+                    factors=[
+                        ScenarioRunSizeFactor(label="selected logical seed groups", count=seed_group_count),
+                        ScenarioRunSizeFactor(label="selected concrete techniques", count=technique_count),
+                    ],
                 )
             ]
 
@@ -689,6 +730,10 @@ class Scenario(ABC):
                 ScenarioRunSizeComponent(
                     label=technique.value,
                     count=compatible_count,
+                    factors=[
+                        ScenarioRunSizeFactor(label="selected concrete techniques", count=1),
+                        ScenarioRunSizeFactor(label="compatible logical seed groups", count=compatible_count),
+                    ],
                 )
             )
         return components
@@ -1265,12 +1310,11 @@ class Scenario(ABC):
             f"(ID: {self._scenario_result_id}, state: {stored_result.scenario_run_state})"
         )
 
-    def _get_completed_objective_hashes_for_attack(self, *, atomic_attack: AtomicAttack) -> set[str]:
+    def _get_completed_objective_hashes_by_attack(self) -> dict[tuple[str, str | None], set[str]]:
         """
-        Return the set of ``objective_sha256`` values already completed (non-error)
-        for a specific atomic attack inside this scenario.
+        Index completed objective hashes for every atomic attack in this scenario.
 
-        Queries ``AttackResultEntry`` rows directly by ``attribution_parent_id`` —
+        Read the persisted attack results once by ``attribution_parent_id`` —
         which is stamped at write-time by the attack persistence path — so
         results from an interrupted run are visible even though the
         ``ScenarioResult.attack_results`` aggregate may not yet reflect them.
@@ -1284,40 +1328,29 @@ class Scenario(ABC):
         ``parent_eval_hash`` was introduced (or by callers that don't supply
         one) match name-only as a backward-compatible fallback.
 
-        Args:
-            atomic_attack (AtomicAttack): The live atomic attack whose
-                ``atomic_attack_name`` and technique identifier scope the query.
-
         Returns:
-            set[str]: ``objective_sha256`` hex strings for completed-without-error rows.
+            dict[tuple[str, str | None], set[str]]: Completed objective hashes keyed by
+                collection name and technique eval hash. A missing eval hash retains
+                the legacy name-only matching behavior.
+
+        Raises:
+            Exception: If persisted progress cannot be read. Treating a failed read as
+                empty progress would re-execute already-completed objectives.
         """
         if not self._scenario_result_id:
-            return set()
+            return {}
 
-        atomic_attack_name = atomic_attack.atomic_attack_name
-        expected_eval_hash = atomic_attack.technique_eval_hash
-
-        completed_hashes: set[str] = set()
-        try:
-            rows = self._memory.get_attack_results(scenario_result_id=self._scenario_result_id)
-            for row in rows:
-                if row.outcome == AttackOutcome.ERROR:
-                    continue
-                if row.attribution_data is None:
-                    continue
-                if row.attribution_data.get("parent_collection") != atomic_attack_name:
-                    continue
-                row_eval_hash = row.attribution_data.get("parent_eval_hash")
-                if row_eval_hash is not None and row_eval_hash != expected_eval_hash:
-                    continue
-                if row.objective:
-                    completed_hashes.add(to_sha256(row.objective))
-        except Exception as e:
-            logger.warning(
-                f"Failed to retrieve completed objective hashes for atomic attack '{atomic_attack_name}': {str(e)}"
-            )
-
-        return completed_hashes
+        rows = self._memory.get_attack_results(scenario_result_id=self._scenario_result_id)
+        completed_by_attack: dict[tuple[str, str | None], set[str]] = {}
+        for row in rows:
+            if row.outcome == AttackOutcome.ERROR or not row.attribution_data or not row.objective:
+                continue
+            name = row.attribution_data.get("parent_collection")
+            eval_hash = row.attribution_data.get("parent_eval_hash")
+            if not isinstance(name, str) or (eval_hash is not None and not isinstance(eval_hash, str)):
+                continue
+            completed_by_attack.setdefault((name, eval_hash), set()).add(to_sha256(row.objective))
+        return completed_by_attack
 
     async def _get_remaining_atomic_attacks_async(self) -> list[AtomicAttack]:
         """
@@ -1327,7 +1360,8 @@ class Scenario(ABC):
         atomic attack enforces uniqueness of objective hashes at construction
         time, and the executor stamps ``attribution_parent_id`` +
         ``attribution_data["parent_collection"]`` on the row so a content-hash
-        join is sufficient.
+        join is sufficient. Each call reads a fresh snapshot before filtering any
+        seed groups; a read failure propagates to the scenario's retry policy.
 
         Returns:
             list[AtomicAttack]: List of atomic attacks with uncompleted objectives.
@@ -1337,9 +1371,14 @@ class Scenario(ABC):
             return self._atomic_attacks
 
         remaining_attacks: list[AtomicAttack] = []
+        # Read and index one snapshot before changing any attack's remaining work.
+        completed_by_attack = self._get_completed_objective_hashes_by_attack()
 
         for atomic_attack in self._atomic_attacks:
-            completed_hashes = self._get_completed_objective_hashes_for_attack(atomic_attack=atomic_attack)
+            name = atomic_attack.atomic_attack_name
+            completed_hashes = completed_by_attack.get((name, atomic_attack.technique_eval_hash), set()) | (
+                completed_by_attack.get((name, None), set())
+            )
 
             if completed_hashes:
                 original_count = len(atomic_attack.seed_groups)
