@@ -248,12 +248,13 @@ class PromptShieldTarget(PromptTarget):
                 split_input = input_str.split("<document>")
 
                 for element in split_input:
-                    contents = element.split("</document>")
+                    contents = element.split("</document>", 1)
 
                     if len(contents) == 1:
                         user_prompt += contents[0]
                     else:
                         documents.append(contents[0])
+                        user_prompt += contents[1]
 
                 return {"userPrompt": user_prompt, "documents": documents if documents else []}
 
