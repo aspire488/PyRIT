@@ -84,6 +84,19 @@ async def test_prompt_shield_document_parsing(
     assert result == sample_delineated_prompt_as_dict
 
 
+async def test_prompt_shield_document_parsing_preserves_text_between_and_after_documents(
+    promptshield_target: PromptShieldTarget,
+):
+    input_str = "prefix <document>doc1</document> between <document>doc2</document> suffix"
+
+    result = promptshield_target._input_parser(input_str)
+
+    assert result == {
+        "userPrompt": "prefix  between  suffix",
+        "documents": ["doc1", "doc2"],
+    }
+
+
 async def test_prompt_shield_response_validation(promptshield_target: PromptShieldTarget):
     # This tests handling both an empty request and an empty response
     promptshield_target._validate_response(request_body={}, response_body={})
