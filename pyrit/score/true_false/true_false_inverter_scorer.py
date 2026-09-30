@@ -16,6 +16,7 @@ from pyrit.models import (
 )
 from pyrit.score.scorer import Scorer
 from pyrit.score.scorer_prompt_validator import ScorerPromptValidator
+from pyrit.score.score_utils import ORIGINAL_FLOAT_VALUE_KEY
 from pyrit.score.true_false.true_false_scorer import TrueFalseScorer
 
 
@@ -128,6 +129,10 @@ class TrueFalseInverterScorer(TrueFalseScorer):
             )
         else:
             inv_score.score_value = str(True) if not inv_score.get_value() else str(False)
+            if inv_score.score_metadata and ORIGINAL_FLOAT_VALUE_KEY in inv_score.score_metadata:
+                inv_score.score_metadata[ORIGINAL_FLOAT_VALUE_KEY] = 1.0 - float(
+                    inv_score.score_metadata[ORIGINAL_FLOAT_VALUE_KEY]
+                )
             inv_score.score_value_description = "Inverted score: " + str(inv_score.score_value_description)
             inv_score.score_rationale = (
                 f"Inverted score from {scorer_type} result: {inv_score.score_value}\n{inv_score.score_rationale}"
