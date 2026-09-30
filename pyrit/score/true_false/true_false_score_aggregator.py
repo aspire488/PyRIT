@@ -9,6 +9,7 @@ from pyrit.score.score_aggregator_result import ScoreAggregatorResult
 from pyrit.score.score_utils import (
     combine_metadata_and_categories,
     format_score_for_rationale,
+    ORIGINAL_FLOAT_VALUE_KEY,
 )
 
 BinaryBoolOp = Callable[[bool | None, bool | None], bool | None]
@@ -144,6 +145,10 @@ def _create_aggregator(
             undetermined_msg=undetermined_msg,
         )
         metadata, category = combine_metadata_and_categories(scores_list)
+        # A single threshold score retains its precise float for feedback. Once multiple
+        # scorers are combined, no single child's float can represent the aggregate verdict.
+        if len(scores_list) > 1:
+            metadata.pop(ORIGINAL_FLOAT_VALUE_KEY, None)
 
         return ScoreAggregatorResult(
             value=result,
