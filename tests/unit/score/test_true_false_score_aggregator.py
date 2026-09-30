@@ -276,3 +276,27 @@ def test_generator_of_wrong_type_still_raises():
     )
     with pytest.raises(ValueError, match="must be of type 'true_false'"):
         TrueFalseScoreAggregator.OR(s for s in [bad])
+
+
+def test_single_threshold_float_metadata_is_preserved() -> None:
+    from pyrit.score.score_utils import ORIGINAL_FLOAT_VALUE_KEY
+
+    score = _mk_score(True, prr_id="1")
+    score.score_metadata = {ORIGINAL_FLOAT_VALUE_KEY: 0.73}
+
+    res = TrueFalseScoreAggregator.AND([score])
+
+    assert res.metadata == {ORIGINAL_FLOAT_VALUE_KEY: 0.73}
+
+
+def test_composite_drops_ambiguous_threshold_float_metadata() -> None:
+    from pyrit.score.score_utils import ORIGINAL_FLOAT_VALUE_KEY
+
+    first = _mk_score(True, prr_id="1")
+    first.score_metadata = {ORIGINAL_FLOAT_VALUE_KEY: 0.73}
+    second = _mk_score(True, prr_id="1")
+    second.score_metadata = {ORIGINAL_FLOAT_VALUE_KEY: 0.41}
+
+    res = TrueFalseScoreAggregator.AND([first, second])
+
+    assert ORIGINAL_FLOAT_VALUE_KEY not in res.metadata
