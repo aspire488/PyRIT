@@ -31,15 +31,14 @@ class StringJoinConverter(WordLevelConverter):
 
     def _build_identifier(self) -> ComponentIdentifier:
         """
-        Build the converter identifier with join parameters.
+        Build the converter identifier with join and word-selection parameters.
 
         Returns:
             ComponentIdentifier: The identifier for this converter.
         """
+        base_identifier = super()._build_identifier()
         return self._create_identifier(
-            params={
-                "join_value": self._join_value,
-            },
+            params={**base_identifier.params, "join_value": self._join_value},
         )
 
     async def convert_word_async(self, word: str) -> str:
