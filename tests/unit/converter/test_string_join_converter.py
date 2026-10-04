@@ -4,6 +4,8 @@
 import pytest
 
 from pyrit.converter import ConverterResult, StringJoinConverter
+from pyrit.converter.text_selection_strategy import WordIndexSelectionStrategy
+from pyrit.registry import ConverterRegistry
 
 
 async def test_string_join_default():
@@ -50,3 +52,39 @@ async def test_string_join_input_not_supported():
     converter = StringJoinConverter()
     with pytest.raises(ValueError):
         await converter.convert_async(prompt="hello", input_type="image_path")
+
+
+def test_string_join_identifier_includes_selection_parameters():
+    first = StringJoinConverter(
+        word_selection_strategy=WordIndexSelectionStrategy(indices=[0]),
+    )
+    second = StringJoinConverter(
+        word_selection_strategy=WordIndexSelectionStrategy(indices=[1]),
+    )
+
+    assert first.get_identifier().hash != second.get_identifier().hash
+    assert first.get_identifier().unique_name != second.get_identifier().unique_name
+
+
+def test_string_join_identifier_normalizes_equivalent_index_sets():
+    first = StringJoinConverter(
+        word_selection_strategy=WordIndexSelectionStrategy(indices=[1, 0]),
+    )
+    second = StringJoinConverter(
+        word_selection_strategy=WordIndexSelectionStrategy(indices=[0, 1]),
+    )
+
+    assert first.get_identifier().hash == second.get_identifier().hash
+
+
+def test_string_join_registry_accepts_distinct_selection_configurations():
+    registry = ConverterRegistry()
+    first = StringJoinConverter(
+        word_selection_strategy=WordIndexSelectionStrategy(indices=[0]),
+    )
+    second = StringJoinConverter(
+        word_selection_strategy=WordIndexSelectionStrategy(indices=[1]),
+    )
+
+    registry.instances.register(first)
+    registry.instances.register(second)
