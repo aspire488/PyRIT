@@ -76,9 +76,18 @@ export interface ConverterPipelineStage {
   readonly converterId: string
 }
 
+export interface ConverterStageResult {
+  readonly stageId: string
+  readonly generated: ConverterPreviewStep
+  value: string
+}
+
 export interface ChatConverterController {
+  readonly editRevision: number
   inputs: ConverterInputPiece[]
+  workingInputs: Record<string, string>
   pipelines: Record<string, ConverterPipelineStage[]>
+  stageResults: Record<string, ConverterStageResult[]>
   results: Record<string, ConverterPreviewResponse>
   errors: Record<string, string>
   applied: Record<string, PieceConversion>
@@ -86,7 +95,10 @@ export interface ChatConverterController {
   addConverter: (pieceType: string, converterId: string) => void
   setPipeline: (pieceType: string, update: (stages: ConverterPipelineStage[]) => ConverterPipelineStage[]) => void
   retainConverters: (availableIds: Set<string>) => void
-  convert: () => Promise<void>
+  convert: (pieceType: string) => Promise<void>
+  convertRemaining: (pieceId: string, stageId: string) => Promise<void>
+  editInput: (pieceId: string, value: string) => void
+  editStageOutput: (pieceId: string, stageId: string, value: string) => void
   apply: () => void
   clear: (pieceId: string) => void
   clearAll: () => void
@@ -119,7 +131,7 @@ export interface MessageMediaDisplayPiece {
 export type MessageDisplayPiece = MessageTextDisplayPiece | MessageMediaDisplayPiece
 
 export interface Message {
-  role: 'user' | 'assistant' | 'simulated_assistant' | 'system'
+  role: 'user' | 'assistant' | 'simulated_assistant' | 'tool' | 'simulated_tool' | 'system'
   content: string
   timestamp: string
   /**
@@ -155,6 +167,12 @@ export interface ChatSendOutcome {
   clearDraft: boolean
 }
 
+/** A filter choice: the value it selects and the text shown for it. */
+export interface FilterOption {
+  value: string
+  label: string
+}
+
 // ============================================================================
 // Backend DTO Types (mirror pyrit/backend/models)
 // ============================================================================
@@ -170,6 +188,7 @@ export interface ConfigurationFileContent {
   content: string
   source: string
   version: string
+  live_reinitialization_enabled: boolean
 }
 
 export interface UpdateConfigurationFileRequest {
@@ -202,6 +221,24 @@ export interface EnvironmentFileListResponse {
 }
 
 // --- Targets ---
+
+export interface TargetReference {
+  readonly registryName: string
+  readonly identifierHash: string
+}
+
+export interface TargetPreferences {
+  readonly objective: TargetReference | null
+  readonly adversarial: TargetReference | null
+}
+
+export interface UserPreferences {
+  readonly targets: TargetPreferences
+  readonly hiddenTargetRegistryNames: string[]
+  readonly labels: Record<string, string | null>
+  readonly theme: ThemeMode
+  readonly chatMarkdown: boolean
+}
 
 export interface TargetCapabilities {
   supports_multi_turn: boolean
@@ -550,6 +587,8 @@ export interface MessagePieceRequest {
   data_type: string // 'text' | 'image_path' | 'audio_path' | 'video_path' | 'binary_path'
   original_value: string
   converted_value?: string
+  converted_value_data_type?: string
+  applied_converter_ids?: string[]
   mime_type?: string
   original_prompt_id?: string
   prompt_metadata?: Record<string, unknown>
@@ -592,6 +631,22 @@ export interface LabelOptionsResponse {
 export interface AddMessageResponse {
   attack: AttackSummary
   messages: ConversationMessagesResponse
+}
+
+export interface MessageSendRequest extends AddMessageRequest {
+  send: true
+  target_registry_name: string
+  submission_id: string
+}
+
+export interface MessageSendStatus {
+  send_id: string
+  attack_result_id: string
+  conversation_id: string
+  request_turn_number: number | null
+  state: 'queued' | 'preparing' | 'sending' | 'finalizing' | 'completed' | 'failed' | 'interrupted'
+  error: string | null
+  failure_stage: 'preparation' | 'sending' | 'finalization' | 'interrupted' | null
 }
 
 export interface AttackListResponse {
@@ -647,6 +702,7 @@ export interface RegisteredScenario {
   default_datasets: string[]
   baseline_policy: 'enabled' | 'disabled' | 'forbidden'
   include_baseline_by_default: boolean
+  uses_default_adversarial_target: boolean
   supported_parameters: Parameter[]
   default_run_size: ScenarioRunSizeEstimateResponse
 }
@@ -665,6 +721,7 @@ export interface ListRegisteredScenariosResponse {
 export interface RunScenarioRequest {
   scenario_name: string
   target_name: string
+  adversarial_target_name?: string | null
   initializers?: string[] | null
   techniques?: string[] | null
   dataset_names?: string[] | null
@@ -696,13 +753,25 @@ export interface ScenarioDatasetSizeCap {
 export interface ScenarioDatasetSummary {
   name: string
   kind: 'dataset' | 'synthesized'
-  logical_seed_group_count: number
-  selected_seed_group_count: number
+  logical_seed_group_count: number | null
+  selected_seed_group_count: number | null
   configured_caps: ScenarioDatasetSizeCap[]
   selection_note: string | null
 }
 
+export type ScenarioDatasetSizeEstimate =
+  | { kind: 'bounded'; value: number }
+  | { kind: 'all_available' }
+  | { kind: 'indeterminate'; detail: string }
+
+export type DatasetLimitInput =
+  | { state: 'value'; value: number }
+  | { state: 'scenario_default' | 'not_applicable'; value?: null }
+
 export interface ScenarioRunSizeEstimateResponse {
+  status?: 'exact' | 'approximate' | 'conditional' | 'unavailable'
+  dataset_size: ScenarioDatasetSizeEstimate
+  dataset_limit: DatasetLimitInput
   estimated_attack_count: number | null
   minimum_attack_count?: number | null
   maximum_attack_count?: number | null
@@ -714,6 +783,7 @@ export interface ScenarioRunSizeEstimateResponse {
 
 export interface ScenarioRunSizeEstimateRequest {
   target_name?: string | null
+  adversarial_target_name?: string | null
   techniques?: string[] | null
   dataset_names?: string[] | null
   max_dataset_size?: number | null
@@ -742,14 +812,16 @@ export interface ScenarioRunEstimateDataset {
   id: string
   name: string
   kind: 'dataset' | 'synthesized'
-  logicalSeedGroupCount: number
-  selectedSeedGroupCount: number
+  logicalSeedGroupCount: number | null
+  selectedSeedGroupCount: number | null
   configuredCaps: ScenarioRunEstimateDatasetCap[]
   selectionNote: string | null
 }
 
 export interface ScenarioRunEstimate {
   scope: 'default' | 'request'
+  datasetSize: ScenarioDatasetSizeEstimate
+  approximate?: boolean
   total: number | null
   minimum?: number | null
   maximum?: number | null
@@ -1096,4 +1168,19 @@ export interface ScenarioRunProgress {
   next_cursor?: string | null
   has_more: boolean
   plan_complete: boolean
+}
+export interface RuntimeReadiness {
+  ready: boolean
+  state: string
+  generation: string
+}
+
+export interface RuntimeStatus {
+  state: string
+  generation: string
+  version: string | null
+  enabled: boolean
+  applying: boolean
+  outcome: string
+  message: string
 }
