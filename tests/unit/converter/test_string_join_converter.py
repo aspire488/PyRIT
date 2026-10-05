@@ -4,7 +4,7 @@
 import pytest
 
 from pyrit.converter import ConverterResult, StringJoinConverter
-from pyrit.converter.text_selection_strategy import WordIndexSelectionStrategy
+from pyrit.converter.text_selection_strategy import AllWordsSelectionStrategy, WordIndexSelectionStrategy
 from pyrit.registry import ConverterRegistry
 
 
@@ -52,6 +52,18 @@ async def test_string_join_input_not_supported():
     converter = StringJoinConverter()
     with pytest.raises(ValueError):
         await converter.convert_async(prompt="hello", input_type="image_path")
+
+
+def test_string_join_default_identifier_preserves_legacy_identity():
+    converter = StringJoinConverter()
+    assert converter.get_identifier().unique_name == "StringJoinConverter::d9ec3367"
+
+
+def test_string_join_explicit_default_strategy_preserves_legacy_identity():
+    converter = StringJoinConverter(
+        word_selection_strategy=AllWordsSelectionStrategy(),
+    )
+    assert converter.get_identifier().unique_name == "StringJoinConverter::d9ec3367"
 
 
 def test_string_join_identifier_includes_selection_parameters():
