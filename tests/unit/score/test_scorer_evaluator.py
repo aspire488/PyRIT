@@ -180,6 +180,48 @@ def test_validate_and_extract_objective_data_scores_only_assistant_message(mock_
     assert mock_objective_scorer._memory.add_message_to_memory.call_count == 2
 
 
+
+@pytest.mark.parametrize(
+    ("conversation_roles", "expected_count"),
+    [
+        (["user"], 0),
+        (["assistant", "assistant"], 2),
+    ],
+)
+def test_validate_and_extract_objective_data_rejects_invalid_assistant_count(
+    mock_objective_scorer, conversation_roles, expected_count
+):
+    conversation_id = "conversation"
+    conversation = [
+        Message(
+            message_pieces=[
+                MessagePiece(
+                    role=role,
+                    original_value=f"Message {index}",
+                    original_value_data_type="text",
+                    conversation_id=conversation_id,
+                    sequence=index,
+                )
+            ]
+        )
+        for index, role in enumerate(conversation_roles)
+    ]
+    dataset = HumanLabeledDataset(
+        name="test_dataset",
+        metrics_type=MetricsType.OBJECTIVE,
+        entries=[ObjectiveHumanLabeledEntry(conversation, [True], "Test objective")],
+        version="1.0",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"Each ObjectiveHumanLabeledEntry must contain exactly one assistant message, but found {expected_count}",
+    ):
+        ObjectiveScorerEvaluator(mock_objective_scorer)._validate_and_extract_data(dataset)
+
+    assert mock_objective_scorer._memory.add_message_to_memory.call_count == len(conversation)
+
+
 async def test_evaluate_dataset_async_objective(mock_objective_scorer):
     responses = [
         Message(message_pieces=[MessagePiece(role="assistant", original_value="test", original_value_data_type="text")])
