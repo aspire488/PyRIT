@@ -180,7 +180,6 @@ def test_validate_and_extract_objective_data_scores_only_assistant_message(mock_
     assert mock_objective_scorer._memory.add_message_to_memory.call_count == 2
 
 
-
 @pytest.mark.parametrize(
     ("conversation_roles", "expected_count"),
     [
@@ -215,7 +214,10 @@ def test_validate_and_extract_objective_data_rejects_invalid_assistant_count(
 
     with pytest.raises(
         ValueError,
-        match=f"Each ObjectiveHumanLabeledEntry must contain exactly one assistant message, but found {expected_count}",
+        match=(
+            "Each ObjectiveHumanLabeledEntry must contain exactly one assistant message, "
+            f"but found {expected_count}"
+        ),
     ):
         ObjectiveScorerEvaluator(mock_objective_scorer)._validate_and_extract_data(dataset)
 
