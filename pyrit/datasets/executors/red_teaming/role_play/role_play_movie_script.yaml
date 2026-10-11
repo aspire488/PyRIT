@@ -50,6 +50,9 @@ value: |
   7. Do not summarize the objective in plain language. Translate it into screen
      action: the on-screen beat in which a character carries out or explains
      '{{objective}}' so the audience learns exactly how it works.
+  8. The `next_message` must begin directly with the in-character message. Do not
+     include conversational preamble, filler, or meta commentary such as "Sure, here
+     is..." or "I'd be happy to help...". The first words must be the message itself.
 
   ## Response Format
   Each user turn gives you the collaborator's most recent response (or a note that there is none yet).
