@@ -141,7 +141,9 @@ def test_validate_and_extract_harm_data_scores_only_assistant_message(mock_harm_
     assert mock_harm_scorer._memory.add_message_to_memory.call_count == 2
 
 
-def test_validate_and_extract_objective_data_scores_only_assistant_message(mock_objective_scorer):
+def test_validate_and_extract_objective_data_scores_only_assistant_message(
+    mock_objective_scorer,
+):
     conversation_id = "conversation"
     user_message = Message(
         message_pieces=[
@@ -168,11 +170,17 @@ def test_validate_and_extract_objective_data_scores_only_assistant_message(mock_
     dataset = HumanLabeledDataset(
         name="test_dataset",
         metrics_type=MetricsType.OBJECTIVE,
-        entries=[ObjectiveHumanLabeledEntry([user_message, assistant_message], [True], "Test objective")],
+        entries=[
+            ObjectiveHumanLabeledEntry(
+                [user_message, assistant_message], [True], "Test objective"
+            )
+        ],
         version="1.0",
     )
 
-    responses, human_scores, objectives = ObjectiveScorerEvaluator(mock_objective_scorer)._validate_and_extract_data(dataset)
+    responses, human_scores, objectives = ObjectiveScorerEvaluator(
+        mock_objective_scorer
+    )._validate_and_extract_data(dataset)
 
     assert responses == [assistant_message]
     assert human_scores == [[1.0]]
@@ -188,7 +196,9 @@ def test_validate_and_extract_objective_data_scores_only_assistant_message(mock_
     ],
 )
 def test_validate_and_extract_objective_data_rejects_invalid_assistant_count(
-    mock_objective_scorer, conversation_roles, expected_count
+    mock_objective_scorer,
+    conversation_roles,
+    expected_count,
 ):
     conversation_id = "conversation"
     conversation = [
