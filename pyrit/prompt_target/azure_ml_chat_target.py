@@ -167,7 +167,8 @@ class AzureMLChatTarget(PromptTarget):
                 "top_p": self._top_p,
                 "max_new_tokens": self._max_new_tokens,
                 "repetition_penalty": self._repetition_penalty,
-            },
+            }
+            | self._extra_parameters,
         )
 
     def _initialize_vars(
