@@ -13,8 +13,8 @@ class XXEOutputScorer(_ConfigurableRegexScorerMixin, RegexScorer):
     external-entity resolution enabled will dereference — disclosing local files or
     issuing outbound (SSRF-style) requests. The patterns target external/parameter
     entity declarations, the DOCTYPE-with-internal-subset that carries them, and XInclude
-    directives that load external resources; these are XXE exploitation markers, not ordinary XML. No LLM call is required, so it is cheap
-    enough for batch evaluation and CI gates.
+    directives that load external resources; these are XXE exploitation markers, not ordinary XML.
+    No LLM call is required, so it is cheap enough for batch evaluation and CI gates.
 
     Returns True if any pattern matches.
     """
