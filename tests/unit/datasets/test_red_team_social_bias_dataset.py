@@ -70,6 +70,7 @@ async def test_fetch_dataset_multi_turn_linked(mock_social_bias_data):
     assert multi_turn_prompts[0].prompt_group_id == multi_turn_prompts[1].prompt_group_id
     assert multi_turn_prompts[0].value == "First turn"
     assert multi_turn_prompts[1].value == "Second turn"
+    assert [prompt.role for prompt in multi_turn_prompts] == ["user", "user"]
 
 
 def test_dataset_name():
