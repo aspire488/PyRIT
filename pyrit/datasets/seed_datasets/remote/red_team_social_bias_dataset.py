@@ -122,6 +122,7 @@ class _RedTeamSocialBiasDataset(_RemoteDatasetLoader):
                             dataset_name=self.dataset_name,
                             prompt_group_id=group_id,
                             sequence=i,
+                            role="user",
                             harm_categories=harm_categories,
                             description=description,
                             authors=self._AUTHORS,
