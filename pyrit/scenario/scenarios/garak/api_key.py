@@ -16,18 +16,23 @@ from pyrit.common import apply_defaults, forward_init_parameters
 from pyrit.executor.attack import AttackConverterConfig, AttackScoringConfig, PromptSendingAttack
 from pyrit.models import (
     AttackSeedGroup,
+    BoundedDatasetSize,
     ScenarioRunSizeComponent,
     ScenarioRunSizeEstimate,
+    ScenarioRunSizeEstimateStatus,
+    ScenarioRunSizeFactor,
     Seed,
     SeedObjective,
     SeedPrompt,
 )
+from pyrit.models.scenario_dataset import DatasetSelectionMode, ScenarioDatasetOptions
 from pyrit.prompt_normalizer import ConverterConfiguration
 from pyrit.scenario.core.atomic_attack import AtomicAttack
 from pyrit.scenario.core.attack_technique import AttackTechnique
 from pyrit.scenario.core.dataset_configuration import (
     DatasetAttackConfiguration,
     DatasetConstraintError,
+    DatasetSource,
     ResolvedDataset,
 )
 from pyrit.scenario.core.scenario import BaselineAttackPolicy, Scenario
@@ -86,10 +91,14 @@ class ApiKeyDatasetConfiguration(DatasetAttackConfiguration):
 
         Args:
             **kwargs (Any): Arguments for ``DatasetAttackConfiguration``.
+
         """
         super().__init__(**kwargs)
         self._techniques: list[ApiKeyTechnique] = [ApiKeyTechnique.GetKey, ApiKeyTechnique.CompleteKey]
         self.excluded_values: tuple[str, ...] = ()
+
+    def _default_max_per_dataset(self) -> Literal["all"]:
+        return "all"
 
     def _set_techniques(self, techniques: Sequence[ApiKeyTechnique]) -> None:
         """Set the techniques whose populations are sampled."""
@@ -102,12 +111,27 @@ class ApiKeyDatasetConfiguration(DatasetAttackConfiguration):
         Returns:
             dict: Technique names mapped to their shared configuration cap.
         """
-        if self.max_dataset_size is None:
+        if self.max_total == "all":
             return {}
         return {
-            str(technique.value): [("combined configuration cap", self.max_dataset_size, "configuration")]
+            str(technique.value): [("combined configuration cap", self.max_total, "configuration")]
             for technique in self._techniques
         }
+
+    def validate_configuration(self) -> None:
+        """
+        Check the corpus selection without reading its contents.
+
+        Raises:
+            DatasetConstraintError: If the required corpus datasets are not selected.
+        """
+        super().validate_configuration()
+        if any(self.source_limit(source.name) != "all" for source in self.sources):
+            raise DatasetConstraintError("ApiKey ingredient sources must be uncapped; use max_total.")
+        if set(self.dataset_names) != set(_CORPUS_DATASETS):
+            raise DatasetConstraintError(
+                f"ApiKey requires exactly these datasets: {list(_CORPUS_DATASETS)}; inline seeds are not supported."
+            )
 
     async def _build_groups_by_dataset_async(self) -> tuple[dict[str, list[AttackSeedGroup]], ResolvedDataset]:
         """
@@ -119,10 +143,6 @@ class ApiKeyDatasetConfiguration(DatasetAttackConfiguration):
         Raises:
             DatasetConstraintError: If the configuration does not select the required corpus.
         """
-        if set(self.dataset_names) != set(_CORPUS_DATASETS):
-            raise DatasetConstraintError(
-                f"ApiKey requires exactly these datasets: {list(_CORPUS_DATASETS)}; inline seeds are not supported."
-            )
         seeds_by_dataset = await self._collect_named_seeds_async()
         seeds = [seed for population in seeds_by_dataset.values() for seed in population]
         self.excluded_values = tuple(
@@ -133,7 +153,7 @@ class ApiKeyDatasetConfiguration(DatasetAttackConfiguration):
             seeds=seeds, source_kind=self.source_kind, dataset_names=tuple(self.dataset_names)
         )
 
-    def _build_technique_populations(self, seeds: list[Seed]) -> dict[str, list[AttackSeedGroup]]:
+    def _build_technique_populations(self, seeds: list[Seed[Any]]) -> dict[str, list[AttackSeedGroup]]:
         """
         Render one request for each selected service and technique input.
 
@@ -191,6 +211,7 @@ class ApiKey(Scenario):
     """
 
     VERSION: int = 1
+    DATASET_OPTIONS = ScenarioDatasetOptions(mode=DatasetSelectionMode.FIXED, per_dataset_limit=False)
     BASELINE_ATTACK_POLICY: ClassVar[BaselineAttackPolicy] = BaselineAttackPolicy.Forbidden
 
     @classmethod
@@ -217,12 +238,22 @@ class ApiKey(Scenario):
             version=self.VERSION,
             technique_class=ApiKeyTechnique,
             default_dataset_config=ApiKeyDatasetConfiguration(
-                dataset_names=self.required_datasets(),
-                max_dataset_size=ApiKeyDatasetConfiguration.DEFAULT_MAX_DATASET_SIZE,
+                sources=[DatasetSource(name=name) for name in self.required_datasets()],
+                max_per_dataset="all",
+                max_total=ApiKeyDatasetConfiguration.DEFAULT_MAX_DATASET_SIZE,
             ),
             objective_scorer=objective_scorer or CredentialLeakScorer(patterns=CredentialLeakScorer.GARAK_PATTERNS),
             scenario_result_id=scenario_result_id,
         )
+
+    def _validate_runtime_configuration(self) -> None:
+        config = self._dataset_config
+        if type(config) is not ApiKeyDatasetConfiguration:
+            raise DatasetConstraintError(
+                f"ApiKey only supports ApiKeyDatasetConfiguration; received {type(config).__name__}."
+            )
+        config._set_techniques([ApiKeyTechnique(technique.value) for technique in self._scenario_techniques])
+        super()._validate_runtime_configuration()
 
     async def _resolve_seed_groups_by_dataset_async(
         self, *, apply_sampling: bool = True
@@ -236,12 +267,7 @@ class ApiKey(Scenario):
         Raises:
             DatasetConstraintError: If an unsupported configuration is supplied.
         """
-        config = self._dataset_config
-        if type(config) is not ApiKeyDatasetConfiguration:
-            raise DatasetConstraintError(
-                f"ApiKey only supports ApiKeyDatasetConfiguration; received {type(config).__name__}."
-            )
-        config._set_techniques([ApiKeyTechnique(technique.value) for technique in self._scenario_techniques])
+        config = cast("ApiKeyDatasetConfiguration", self._dataset_config)
         groups = await config.get_attack_groups_by_dataset_async(apply_sampling=apply_sampling)
         if self._uses_default_scorer:
             self._objective_scorer = CredentialLeakScorer.from_excluded_values(
@@ -250,22 +276,36 @@ class ApiKey(Scenario):
             self._objective_scorer_identifier = self._objective_scorer.get_identifier()
         return groups
 
-    async def _estimate_run_size_async(self) -> ScenarioRunSizeEstimate:
+    async def _estimate_run_size_async(self, *, budget: BoundedDatasetSize) -> ScenarioRunSizeEstimate:
         """
         Count each synthesized request once rather than crossing techniques again.
 
         Returns:
             ScenarioRunSizeEstimate: The selected request count.
+
+        Raises:
+            DatasetConstraintError: If the dataset configuration is not supported.
         """
-        groups, datasets = await self._resolve_dataset_groups_for_estimate_async()
+        config = self._dataset_config
+        if not isinstance(config, ApiKeyDatasetConfiguration):
+            raise DatasetConstraintError("ApiKey requires an ApiKeyDatasetConfiguration.")
+        config._set_techniques([ApiKeyTechnique(technique.value) for technique in self._scenario_techniques])
+        count, datasets = await self._get_dataset_size_for_estimate_async(budget=budget)
         for dataset in datasets:
             dataset.kind = "synthesized"
+        components = [
+            ScenarioRunSizeComponent(
+                label="Synthesized requests",
+                count=count,
+                factors=[
+                    ScenarioRunSizeFactor(label="selected request estimate", count=count),
+                ],
+            )
+        ]
         return ScenarioRunSizeEstimate(
-            estimated_attack_count=sum(len(population) for population in groups.values()),
-            components=[
-                ScenarioRunSizeComponent(label=f"{name} prompts", count=len(population))
-                for name, population in groups.items()
-            ],
+            status=ScenarioRunSizeEstimateStatus.Exact,
+            total_attack_count=sum(component.count for component in components),
+            components=components,
             datasets=datasets,
         )
 
@@ -278,7 +318,9 @@ class ApiKey(Scenario):
         """
         attacks: list[AtomicAttack] = []
         for technique_name, seed_groups in context.seed_groups_by_dataset.items():
-            converters = self._technique_converters.get(technique_name, [])
+            if not seed_groups:
+                continue
+            converters = context.technique_converters.get(technique_name, [])
             converter_config = (
                 AttackConverterConfig(
                     request_converters=ConverterConfiguration.from_converters(converters=list(converters))

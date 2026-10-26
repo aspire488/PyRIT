@@ -3,6 +3,8 @@
 
 """Tests for the Jailbreak class."""
 
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,7 +24,8 @@ from pyrit.prompt_target import PromptTarget
 from pyrit.registry import TargetRegistry
 from pyrit.registry.components.attack_technique_registry import AttackTechniqueRegistry
 from pyrit.registry.components.scenario_registry import ScenarioRegistry
-from pyrit.scenario.core import BaselineAttackPolicy
+from pyrit.scenario import IncompatibleTechniqueError
+from pyrit.scenario.core import BaselineAttackPolicy, DatasetAttackConfiguration
 from pyrit.scenario.core.attack_technique_factory import AttackTechniqueFactory
 from pyrit.scenario.scenarios.airt.jailbreak import (
     _DEFAULT_NUM_JAILBREAKS,
@@ -88,7 +91,7 @@ def mock_memory_seed_groups() -> list[AttackSeedGroup]:
 
 
 @pytest.fixture
-def mock_objective_target() -> PromptTarget:
+def mock_objective_target() -> MagicMock:
     """Create a mock objective target that cannot carry native system-prompt delivery.
 
     ``configuration.includes(...)`` returns ``False`` so the default technique set degrades to the
@@ -101,7 +104,7 @@ def mock_objective_target() -> PromptTarget:
 
 
 @pytest.fixture
-def mock_capable_target() -> PromptTarget:
+def mock_capable_target() -> MagicMock:
     """Create a mock objective target that natively supports editable history + system prompts."""
     mock = MagicMock(spec=PromptTarget)
     mock.get_identifier.return_value = ComponentIdentifier(class_name="MockCapableTarget", class_module="test")
@@ -110,7 +113,7 @@ def mock_capable_target() -> PromptTarget:
 
 
 @pytest.fixture
-def mock_objective_scorer() -> TrueFalseInverterScorer:
+def mock_objective_scorer() -> MagicMock:
     """Create a mock scorer for testing."""
     mock = MagicMock(spec=TrueFalseInverterScorer)
     mock.get_identifier.return_value = ComponentIdentifier(class_name="MockObjectiveScorer", class_module="test")
@@ -136,13 +139,18 @@ def mock_runtime_env():
 FIXTURES = ["patch_central_database", "mock_runtime_env"]
 
 
-def _patch_seed_groups(seed_groups):
-    return patch.object(
-        Jailbreak,
-        "_resolve_seed_groups_by_dataset_async",
-        new_callable=AsyncMock,
-        return_value={"harmbench": seed_groups},
-    )
+@contextmanager
+def _patch_seed_groups(seed_groups: list[AttackSeedGroup]) -> Generator[None, None, None]:
+    with (
+        patch.object(DatasetAttackConfiguration, "prepare_async", new_callable=AsyncMock),
+        patch.object(
+            Jailbreak,
+            "_resolve_seed_groups_by_dataset_async",
+            new_callable=AsyncMock,
+            return_value={"harmbench": seed_groups},
+        ),
+    ):
+        yield
 
 
 def _default_args(target, **extra):
@@ -189,6 +197,13 @@ class TestJailbreakInitialization:
         with pytest.raises(ValueError, match="num_jailbreak_attempts must be at least 1"):
             scenario.set_params_from_args(args={"num_jailbreak_attempts": num_attempts})
 
+    @pytest.mark.parametrize("num_jailbreaks", [0, -1])
+    def test_rejects_non_positive_num_jailbreaks(self, mock_objective_scorer, num_jailbreaks: int) -> None:
+        scenario = Jailbreak(objective_scorer=mock_objective_scorer)
+
+        with pytest.raises(ValueError, match="num_jailbreaks must be at least 1"):
+            scenario.set_params_from_args(args={"num_jailbreaks": num_jailbreaks})
+
     async def test_default_draws_random_template_sample(
         self, mock_objective_target, mock_objective_scorer, mock_memory_seed_groups
     ):
@@ -199,6 +214,11 @@ class TestJailbreakInitialization:
             await scenario.initialize_async()
             assert len(scenario._resolved_jailbreaks) == _DEFAULT_NUM_JAILBREAKS
             assert set(scenario._resolved_jailbreaks).issubset(set(TextJailBreak.get_jailbreak_templates()))
+            assert len(scenario._atomic_attacks) == _DEFAULT_NUM_JAILBREAKS
+            for attack in scenario._atomic_attacks:
+                assert [group.objective.value for group in attack.seed_groups] == [
+                    group.objective.value for group in mock_memory_seed_groups
+                ]
 
     async def test_num_jailbreaks_samples_that_many(
         self, mock_objective_target, mock_objective_scorer, mock_memory_seed_groups
@@ -230,9 +250,11 @@ class TestJailbreakInitialization:
             estimate = await scenario.get_run_size_estimate_async(target_is_configured=True)
         assert estimate.estimated_attack_count == 8
         assert [component.label for component in estimate.components] == ["Inline jailbreak delivery"]
-        assert estimate.datasets[0].logical_seed_group_count == 4
-        assert estimate.datasets[0].selected_seed_group_count == 4
-        assert [(cap.label, cap.count) for cap in estimate.datasets[0].configured_caps] == [("per-dataset cap", 4)]
+        assert estimate.datasets[0].logical_seed_group_count is None
+        assert estimate.datasets[0].selected_seed_group_count is None
+        assert [(cap.label, cap.count) for cap in estimate.datasets[0].configured_caps] == [
+            ("combined configuration cap", 4)
+        ]
 
     async def test_run_size_is_conditional_when_system_delivery_target_is_not_selected(
         self, mock_objective_scorer
@@ -252,8 +274,8 @@ class TestJailbreakInitialization:
 
             estimate = await scenario.get_run_size_estimate_async(target_is_configured=False)
         assert estimate.estimated_attack_count is None
-        assert estimate.minimum_attack_count == 2
-        assert estimate.maximum_attack_count == 4
+        assert estimate.minimum_attack_count is None
+        assert estimate.maximum_attack_count == 16
         assert [component.label for component in estimate.components] == [
             "Inline jailbreak delivery",
             "Native system-prompt jailbreak delivery",
@@ -261,7 +283,7 @@ class TestJailbreakInitialization:
         assert "native system-prompt delivery is supported" in (estimate.note or "")
 
     async def test_system_only_run_size_excludes_incompatible_target_outcome(self, mock_objective_scorer) -> None:
-        """The targetless range includes only outcomes that can produce a valid run."""
+        """The targetless upper bound does not imply that the dataset fills its cap."""
         seed_groups = [AttackSeedGroup(seeds=[SeedObjective(value="objective")])]
         technique_class = _build_jailbreak_technique()
         with _patch_seed_groups(seed_groups):
@@ -277,9 +299,42 @@ class TestJailbreakInitialization:
             estimate = await scenario.get_run_size_estimate_async(target_is_configured=False)
 
         assert estimate.estimated_attack_count is None
-        assert estimate.minimum_attack_count == 2
-        assert estimate.maximum_attack_count == 2
+        assert estimate.minimum_attack_count is None
+        assert estimate.maximum_attack_count == 8
         assert "incompatible targets cannot run it" in (estimate.note or "")
+
+    @pytest.mark.parametrize("supports_system", [False, True])
+    async def test_conditional_estimate_does_not_use_cap_as_minimum_async(
+        self,
+        *,
+        mock_objective_scorer: TrueFalseInverterScorer,
+        mock_objective_target: PromptTarget,
+        supports_system: bool,
+    ) -> None:
+        scenario = Jailbreak(objective_scorer=mock_objective_scorer)
+        args = {
+            "scenario_techniques": [_technique_class()("default")],
+            "include_baseline": False,
+            "num_jailbreaks": 1,
+            "dataset_config": DatasetAttackConfiguration(
+                seed_groups=[AttackSeedGroup(seeds=[SeedObjective(value="one objective")])],
+                max_dataset_size=5,
+            ),
+        }
+        scenario.set_params_from_args(args=args)
+        estimate = await scenario.get_run_size_estimate_async()
+        assert estimate.estimated_attack_count is None
+        assert estimate.minimum_attack_count is None
+        assert estimate.maximum_attack_count == 10
+        assert [component.count for component in estimate.components] == [5, 5]
+
+        mock_objective_target.configuration.includes.return_value = supports_system
+        scenario.set_params_from_args(args={**args, "objective_target": mock_objective_target})
+        await scenario.initialize_async()
+        plan = scenario._build_run_plan()
+        actual_count = sum(len(group.seed_group_ids) for group in plan.atomic_groups)
+        assert actual_count == (2 if supports_system else 1)
+        assert actual_count <= estimate.maximum_attack_count
 
     async def test_mutually_exclusive_selectors_raise(
         self, mock_objective_target, mock_objective_scorer, mock_memory_seed_groups
@@ -323,7 +378,7 @@ class TestJailbreakInitialization:
 
         scenario = Jailbreak(objective_scorer=mock_objective_scorer)
         with patch(
-            "pyrit.scenario.core.dataset_configuration.DatasetConfiguration._fetch_dataset_async",
+            "pyrit.scenario.core.dataset_configuration.DatasetConfiguration.prepare_async",
             new_callable=AsyncMock,
         ):
             scenario.set_params_from_args(args={"objective_target": mock_objective_target})
@@ -545,6 +600,25 @@ class TestJailbreakAttackGeneration:
 
 @pytest.mark.usefixtures(*FIXTURES)
 class TestJailbreakSystemPromptDelivery:
+    async def test_strict_policy_raises_even_with_compatible_delivery_async(
+        self,
+        *,
+        mock_objective_target: PromptTarget,
+        mock_objective_scorer: MagicMock,
+        mock_memory_seed_groups: list[AttackSeedGroup],
+    ) -> None:
+        with _patch_seed_groups(mock_memory_seed_groups):
+            scenario = Jailbreak(objective_scorer=mock_objective_scorer)
+            scenario.set_params_from_args(
+                args=_default_args(
+                    mock_objective_target,
+                    incompatible_technique_policy="raise",
+                    jailbreak_names=["aim.yaml"],
+                )
+            )
+            with pytest.raises(IncompatibleTechniqueError, match="jailbreak_system_prompt.*incompatible"):
+                await scenario.initialize_async()
+
     """Tests for the ``jailbreak_system_prompt`` native system-prompt delivery (J5)."""
 
     async def test_capable_target_builds_both_deliveries(
@@ -637,7 +711,7 @@ class TestJailbreakSystemPromptDelivery:
                     jailbreak_names=["aim.yaml"],
                 )
             )
-            with pytest.raises(ValueError, match="natively supports"):
+            with pytest.raises(ValueError, match="no usable selected techniques"):
                 await scenario.initialize_async()
 
     async def test_system_delivery_end_to_end_keeps_objective_live(self, mock_memory_seed_groups):
@@ -648,9 +722,10 @@ class TestJailbreakSystemPromptDelivery:
         system-role framing seed leaves the seed group with no ``next_message``, so ``PromptSendingAttack``
         must fall back to sending the objective itself as the user turn.
         """
+        from unit.mocks import MockPromptTarget
+
         from pyrit.memory import CentralMemory
         from pyrit.score import SubStringScorer
-        from tests.unit.mocks import MockPromptTarget
 
         target = MockPromptTarget()  # capable: native editable history + system prompt
         technique_class = _build_jailbreak_technique()
@@ -669,7 +744,7 @@ class TestJailbreakSystemPromptDelivery:
             await scenario.initialize_async()
             await scenario._atomic_attacks[0].run_async()
 
-        pieces = CentralMemory.get_memory_instance().get_message_pieces()
+        pieces = await CentralMemory.get_memory_instance().get_message_pieces_async()
         system_values = [p.converted_value for p in pieces if p.role == "system"]
         user_values = [p.converted_value for p in pieces if p.role == "user"]
         objectives = {g.objective.value for g in mock_memory_seed_groups}
@@ -685,9 +760,10 @@ class TestJailbreakSystemPromptDelivery:
         The framing technique declares prepend placement so this merge does not depend on the
         caller's sequence values.
         """
+        from unit.mocks import MockPromptTarget
+
         from pyrit.memory import CentralMemory
         from pyrit.score import SubStringScorer
-        from tests.unit.mocks import MockPromptTarget
 
         target = MockPromptTarget()  # capable: native editable history + system prompt
         technique_class = _build_jailbreak_technique()
@@ -714,7 +790,7 @@ class TestJailbreakSystemPromptDelivery:
             # Must not raise a same-sequence role collision.
             await scenario._atomic_attacks[0].run_async()
 
-        pieces = CentralMemory.get_memory_instance().get_message_pieces()
+        pieces = await CentralMemory.get_memory_instance().get_message_pieces_async()
         system_values = [p.converted_value for p in pieces if p.role == "system"]
         user_values = [p.converted_value for p in pieces if p.role == "user"]
         assert any("Niccolo" in v for v in system_values), "jailbreak framing not delivered as a system prompt"
@@ -746,8 +822,8 @@ class TestJailbreakResumePersistence:
             persisted = ["persisted_a.yaml", "persisted_b.yaml"]
             stored = MagicMock()
             stored.metadata = {_JAILBREAK_TEMPLATES_METADATA_KEY: persisted}
-            with patch.object(scenario._memory, "get_scenario_results", return_value=[stored]):
-                assert scenario._resolve_templates() == persisted
+            with patch.object(scenario._memory, "get_scenario_results_async", return_value=[stored]):
+                assert (await scenario._resolve_templates_async()) == persisted
 
 
 @pytest.mark.usefixtures(*FIXTURES)

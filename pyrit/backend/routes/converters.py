@@ -10,7 +10,7 @@ Converter types are set at app startup - you cannot add new types at runtime.
 
 from fastapi import APIRouter, HTTPException, status
 
-from pyrit.backend.models.common import ProblemDetail
+from pyrit.backend.models.common import IdentifierStr, ProblemDetail
 from pyrit.backend.models.converters import (
     ConverterInstance,
     ConverterInstanceListResponse,
@@ -18,6 +18,7 @@ from pyrit.backend.models.converters import (
     ConverterPreviewResponse,
     ConverterTypeResponse,
     CreateConverterRequest,
+    UnregisteredConverter,
 )
 from pyrit.backend.services.converter_service import get_converter_service
 
@@ -58,21 +59,23 @@ async def list_converter_types() -> ConverterTypeResponse:  # pyrit-async-suffix
 
 @router.post(
     "",
-    response_model=ConverterInstance,
+    response_model=ConverterInstance | UnregisteredConverter,
     status_code=status.HTTP_201_CREATED,
     responses={
         400: {"model": ProblemDetail, "description": "Invalid converter type or parameters"},
     },
 )
-async def create_converter(request: CreateConverterRequest) -> ConverterInstance:  # pyrit-async-suffix-exempt
+async def create_converter(
+    request: CreateConverterRequest,
+) -> ConverterInstance | UnregisteredConverter:  # pyrit-async-suffix-exempt
     """
     Create a new converter instance.
 
-    Instantiates a converter with the given type and parameters.
+    Instantiates a converter with the given type and parameters, with optional registration.
     Supports nested converters via converter_id references in params.
 
     Returns:
-        ConverterInstance: The created converter instance details.
+        ConverterInstance | UnregisteredConverter: A named instance or an unregistered descriptor.
     """
     service = get_converter_service()
 
@@ -97,7 +100,7 @@ async def create_converter(request: CreateConverterRequest) -> ConverterInstance
         404: {"model": ProblemDetail, "description": "Converter not found"},
     },
 )
-async def get_converter(converter_id: str) -> ConverterInstance:  # pyrit-async-suffix-exempt
+async def get_converter(converter_id: IdentifierStr) -> ConverterInstance:  # pyrit-async-suffix-exempt
     """
     Get a converter instance by ID.
 
@@ -123,7 +126,7 @@ async def get_converter(converter_id: str) -> ConverterInstance:  # pyrit-async-
         404: {"model": ProblemDetail, "description": "Converter not found"},
     },
 )
-async def delete_converter(converter_id: str) -> None:  # pyrit-async-suffix-exempt
+async def delete_converter(converter_id: IdentifierStr) -> None:  # pyrit-async-suffix-exempt
     """Delete a converter instance by registry name."""
     service = get_converter_service()
     if not await service.delete_converter_async(converter_id=converter_id):

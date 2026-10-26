@@ -7,12 +7,14 @@ import threading
 from collections.abc import Callable
 
 import pytest
+from unit.async_utils import TEST_WATCHDOG_SECONDS
 
 from pyrit.common.random_context import configure_random_seed
 from pyrit.converter import (
     AnsiAttackConverter,
     AsciiArtConverter,
     AskToDecodeConverter,
+    CharNoiseConverter,
     CharSwapConverter,
     ColloquialWordswapConverter,
     Converter,
@@ -46,6 +48,7 @@ def _stochastic_converter_cases() -> list[tuple[Callable[[], Converter], str]]:
     return [
         (AskToDecodeConverter, "encoded text"),
         (lambda: AsciiArtConverter(font="rand"), "random font"),
+        (lambda: AsciiArtConverter(font="mix"), "mixed random font"),
         (lambda: RandomCapitalLettersConverter(percentage=50.0), "abcdefghijklmnopqrstuvwxyz"),
         (EmojiConverter, "deterministic emoji output"),
         (
@@ -56,6 +59,7 @@ def _stochastic_converter_cases() -> list[tuple[Callable[[], Converter], str]]:
             "deterministic character swapping output",
         ),
         (lambda: InsertPunctuationConverter(word_swap_ratio=0.5), "deterministic punctuation output"),
+        (lambda: CharNoiseConverter(noise_probability=0.5), "deterministic character noise output"),
         (AnsiAttackConverter, "deterministic ANSI output"),
         (TemplateSegmentConverter, "deterministic template segment output"),
         (
@@ -131,7 +135,7 @@ class _ParallelThreadRandomConverter(Converter):
         barrier = threading.Barrier(2)
 
         def draw() -> tuple[random.Random, float]:
-            barrier.wait(timeout=5)
+            barrier.wait(timeout=TEST_WATCHDOG_SECONDS)
             rng = self._get_random_generator(stream="values")
             return (rng, rng.random())
 

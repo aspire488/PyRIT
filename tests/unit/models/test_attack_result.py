@@ -1,10 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from contextlib import closing
 from datetime import UTC, datetime
 
 import pytest
+from unit.mocks import run_memory_session_async
 
 from pyrit.memory.memory_models import AttackResultEntry
 from pyrit.models import AttackOutcome, AttackResult, ComponentIdentifier, ConversationReference, ConversationType
@@ -71,21 +71,22 @@ class TestAttackResultTimestamp:
 
         assert hydrated.timestamp == persisted_ts
 
-    def test_naive_entry_timestamp_is_normalized_to_utc_on_hydration(self, sqlite_instance) -> None:
+    async def test_naive_entry_timestamp_is_normalized_to_utc_on_hydration_async(self, sqlite_instance) -> None:
         """SQLite stores datetimes without tzinfo; the UTCDateTime column attaches UTC on read."""
         original = AttackResult(conversation_id="c1", objective="test")
         entry = AttackResultEntry(entry=original)
         entry.timestamp = datetime(2026, 4, 17, 12, 0, 0)  # noqa: DTZ001
+        entry_id = entry.id
 
-        with closing(sqlite_instance.get_session()) as session:
+        async with await sqlite_instance.get_session_async() as session:
             session.add(entry)
-            session.commit()
-            entry_id = entry.id
+            await session.commit()
 
-        with closing(sqlite_instance.get_session()) as session:
+        def hydrate(session):
             reloaded = session.get(AttackResultEntry, entry_id)
-            hydrated = reloaded.get_attack_result()
+            return reloaded.get_attack_result()
 
+        hydrated = await run_memory_session_async(memory=sqlite_instance, operation=hydrate)
         assert hydrated.timestamp is not None
         assert hydrated.timestamp.tzinfo is UTC
         assert hydrated.timestamp.replace(tzinfo=None) == datetime(2026, 4, 17, 12, 0, 0)  # noqa: DTZ001
@@ -353,6 +354,21 @@ def test_last_score_falls_back_to_automated_score() -> None:
     assert result.last_score is automated_score
     with pytest.raises(AttributeError, match="has no setter|can't set attribute"):
         result.last_score = None
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({AttackResult.TECHNIQUE_NAME_METADATA_KEY: "crescendo"}, "crescendo"),
+        ({}, None),
+        ({AttackResult.TECHNIQUE_NAME_METADATA_KEY: ""}, None),
+        ({AttackResult.TECHNIQUE_NAME_METADATA_KEY: 42}, None),
+    ],
+)
+def test_technique_name_reads_a_non_empty_string_from_metadata(metadata: dict, expected: str | None) -> None:
+    result = AttackResult(conversation_id="conv-1", objective="test", metadata=metadata)
+
+    assert result.technique_name == expected
 
 
 class TestAttackResultValidation:

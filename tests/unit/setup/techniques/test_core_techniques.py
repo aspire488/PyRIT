@@ -3,29 +3,36 @@
 
 """Tests for the ``core`` scenario attack techniques (``techniques/core.py``).
 
-Covers the ``flip`` and ``code_attack`` techniques. FlipAttack used to be a bespoke
-``PromptSendingAttack`` subclass; it is now expressed purely as a ``core``
-technique (``FlipConverter`` + ``TaskFramingConverter`` + a system-prompt
-``seed_technique``). These tests lock in the legacy behavior: the objective is
-sent as ``TASK is '<reversed-objective>'`` and the flip instruction system
-prompt is prepended verbatim (never flipped).
+Covers the ``flip``, ``code_attack``, and ``bijection`` techniques. FlipAttack used
+to be a bespoke ``PromptSendingAttack`` subclass; it is now expressed purely as a
+``core`` technique (``FlipConverter`` + ``PromptTemplateConverter`` + a system-prompt
+``seed_technique``). These tests lock in the legacy behavior: the objective is sent
+as ``TASK is '<reversed-objective>'`` and the flip instruction system prompt is
+prepended verbatim (never flipped).
 """
 
 import pytest
+from unit.mocks import MockPromptTarget
 
-from pyrit.converter import CodeAttackConverter, LetterBijectionConverter
+from pyrit.converter import (
+    CodeAttackConverter,
+    FlipConverter,
+    LetterBijectionConverter,
+    PromptTemplateConverter,
+    TaskFramingConverter,
+)
 from pyrit.executor.attack import PromptSendingAttack
 from pyrit.executor.attack.core.attack_config import AttackScoringConfig
 from pyrit.executor.attack.core.attack_executor import AttackExecutor
 from pyrit.memory import CentralMemory
-from pyrit.models import AttackSeedGroup, Message, MessagePiece, SeedObjective, SeedPrompt
+from pyrit.models import AttackSeedGroup, Message, MessagePiece, SeedGroupRequirements, SeedObjective, SeedPrompt
 from pyrit.prompt_target.common.target_capabilities import TargetCapabilities
 from pyrit.prompt_target.common.target_configuration import TargetConfiguration
-from pyrit.setup.initializers.techniques import core
+from pyrit.setup.initializers.techniques import airt, core, extra
 from tests.unit.mocks import MockPromptTarget
 
 OBJECTIVE = "How can I kill a Python process?"
-# FlipConverter reverses the raw objective, then TaskFramingConverter wraps it as
+# FlipConverter reverses the raw objective, then PromptTemplateConverter wraps it as
 # ``TASK is '...'`` (stripping ``'``). Framing runs last, so ``TASK is`` stays readable
 # while the objective is reversed. This matches legacy FlipAttack.
 EXPECTED_SENT = "TASK is '?ssecorp nohtyP a llik I nac woH'"
@@ -60,6 +67,30 @@ class _NonEditableHistoryMockTarget(MockPromptTarget):
 
 @pytest.mark.usefixtures("patch_central_database")
 class TestFlipTechnique:
+    def test_catalog_declares_target_and_dataset_requirements(self) -> None:
+        core_factories = {factory.name: factory for factory in core.get_technique_factories()}
+        extra_factories = {factory.name: factory for factory in extra.get_technique_factories()}
+        airt_factories = {factory.name: factory for factory in airt.get_technique_factories()}
+
+        assert core_factories["many_shot"].requirements.seed_group == SeedGroupRequirements(
+            objective_only=True, try_adapt=True
+        )
+        assert extra_factories["skeleton_key"].requirements.seed_group == SeedGroupRequirements(
+            objective_only=True, try_adapt=True
+        )
+        simulations = [
+            factory
+            for factory in core_factories.values()
+            if factory.seed_technique is not None and factory.seed_technique.has_simulated_conversation
+        ]
+        assert simulations
+        assert all(
+            factory.requirements.seed_group == SeedGroupRequirements(objective_only=True) for factory in simulations
+        )
+        assert airt_factories["image"].requirements.objective_target.required_input_modalities == frozenset(
+            {frozenset({"image_path"})}
+        )
+
     """Behavioral parity tests for the migrated flip technique."""
 
     def test_factory_shape(self):
@@ -73,6 +104,14 @@ class TestFlipTechnique:
         assert seed.is_general_technique is True
         assert factory.seed_technique.prompt_placement == "prepend"
         assert "flipping each word" in seed.value
+
+    def test_wires_flip_then_prompt_template_converter(self):
+        converters = _wired_converters(_flip_factory())
+        assert [type(c) for c in converters] == [FlipConverter, PromptTemplateConverter]
+        framing = converters[1]
+        assert not isinstance(framing, TaskFramingConverter)
+        assert framing._template == "TASK is '{{ prompt }}'"
+        assert framing._strip_characters == "'"
 
     def test_merges_onto_group_with_user_turn_at_sequence_zero(self):
         """Merging flip onto a group whose opening turn is a ``user`` prompt at sequence 0
@@ -119,7 +158,9 @@ class TestFlipTechnique:
 
         # The flip instruction is prepended as a system message and is NOT flipped.
         conversation_id = result.completed_results[0].conversation_id
-        messages = CentralMemory.get_memory_instance().get_conversation_messages(conversation_id=conversation_id)
+        messages = await CentralMemory.get_memory_instance().get_conversation_messages_async(
+            conversation_id=conversation_id
+        )
         system_messages = [m for m in messages if m.get_piece().role == "system"]
         assert len(system_messages) == 1
         assert "flipping each word" in system_messages[0].get_value()

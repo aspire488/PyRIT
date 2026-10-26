@@ -7,7 +7,7 @@ import {
 } from '@fluentui/react-components'
 import { QuestionCircleRegular } from '@fluentui/react-icons'
 
-import LabelsBar from '@/components/Labels/LabelsBar'
+import LabelsBar, { type OperationControlProps } from '@/components/Labels/LabelsBar'
 import { useTheme } from '@/hooks/useTheme'
 
 import { versionApi } from '../../services/api'
@@ -15,7 +15,7 @@ import Navigation, { type ViewName } from '../Sidebar/Navigation'
 import { UserAccountButton } from '../UserAccountButton'
 import { useMainLayoutStyles } from './MainLayout.styles'
 
-interface MainLayoutProps {
+interface MainLayoutProps extends OperationControlProps {
   children: React.ReactNode
   currentView: ViewName
   onNavigate: (view: ViewName) => void
@@ -23,6 +23,7 @@ interface MainLayoutProps {
   canManageConfiguration: boolean
   labels: Record<string, string>
   onLabelsChange: (labels: Record<string, string>) => void
+  operatorReadOnly?: boolean
   toolbarRef?: React.Ref<HTMLDivElement>
   onStartTour?: () => void
 }
@@ -35,6 +36,10 @@ export default function MainLayout({
   canManageConfiguration,
   labels,
   onLabelsChange,
+  operation,
+  onOperationChange,
+  onRetryOperation,
+  operatorReadOnly,
   toolbarRef,
   onStartTour,
 }: MainLayoutProps) {
@@ -128,20 +133,17 @@ export default function MainLayout({
           )}
           <section
             className={styles.labelsSection}
-            aria-label="New run labels"
+            aria-label="Default Labels"
             data-tour="labels-card"
           >
             <div className={styles.labelsRow}>
               <div className={styles.labelsControls}>
-                <Text weight="semibold" className={styles.labelsTitle}>New run labels</Text>
-                <LabelsBar labels={labels} onLabelsChange={onLabelsChange} />
+                <LabelsBar labels={labels} onLabelsChange={onLabelsChange} operatorReadOnly={operatorReadOnly}
+              operation={operation} onOperationChange={onOperationChange} onRetryOperation={onRetryOperation} />
               </div>
-              <div ref={toolbarRef} className={styles.toolbarSlot} />
             </div>
-            <Text size={200} className={styles.labelsHint}>
-              Used for new attacks and scans. Existing runs keep their original labels.
-            </Text>
           </section>
+          <div ref={toolbarRef} className={styles.toolbarSlot} />
           {children}
         </main>
       </div>

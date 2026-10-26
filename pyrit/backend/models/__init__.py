@@ -31,6 +31,7 @@ if TYPE_CHECKING:
         CreateConversationResponse,
         MessagePieceRequest,
         MessagePieceView,
+        MessageRequest,
         MessageView,
         PrependedMessageRequest,
         ScoreView,
@@ -62,7 +63,26 @@ if TYPE_CHECKING:
         ListRegisteredInitializersResponse,
         RegisterInitializerRequest,
     )
+    from pyrit.backend.models.scenario_presets import (
+        PresetIssue,
+        ResolveScenarioPresetRequest,
+        ScenarioPresetListResponse,
+        ScenarioPresetResponse,
+        UpdateScenarioPresetRequest,
+    )
+    from pyrit.backend.models.scenario_suites import (
+        ScenarioSuiteEntryStatus,
+        ScenarioSuiteListResponse,
+        ScenarioSuiteResponse,
+        UpdateScenarioSuiteRequest,
+    )
     from pyrit.backend.models.scenarios import ListRegisteredScenariosResponse, ScenarioRunListResponse
+    from pyrit.backend.models.scorers import (
+        CreateScorerRequest,
+        ScorerListResponse,
+        ScorerTypeEntry,
+        ScorerTypeResponse,
+    )
     from pyrit.backend.models.targets import CreateTargetRequest, TargetListResponse
 
 _LAZY_EXPORTS: dict[str, str | tuple[str, str | None]] = {
@@ -85,6 +105,7 @@ _LAZY_EXPORTS: dict[str, str | tuple[str, str | None]] = {
     "CreateConversationResponse": "pyrit.backend.models.attacks",
     "MessagePieceRequest": "pyrit.backend.models.attacks",
     "MessagePieceView": "pyrit.backend.models.attacks",
+    "MessageRequest": "pyrit.backend.models.attacks",
     "MessageView": "pyrit.backend.models.attacks",
     "PrependedMessageRequest": "pyrit.backend.models.attacks",
     "ScoreView": "pyrit.backend.models.attacks",
@@ -106,7 +127,20 @@ _LAZY_EXPORTS: dict[str, str | tuple[str, str | None]] = {
     "PreviewStep": "pyrit.backend.models.converters",
     "DatasetInfo": "pyrit.backend.models.datasets",
     "DatasetListResponse": "pyrit.backend.models.datasets",
+    "PresetIssue": "pyrit.backend.models.scenario_presets",
+    "ResolveScenarioPresetRequest": "pyrit.backend.models.scenario_presets",
+    "ScenarioPresetListResponse": "pyrit.backend.models.scenario_presets",
+    "ScenarioPresetResponse": "pyrit.backend.models.scenario_presets",
+    "UpdateScenarioPresetRequest": "pyrit.backend.models.scenario_presets",
+    "ScenarioSuiteEntryStatus": "pyrit.backend.models.scenario_suites",
+    "ScenarioSuiteListResponse": "pyrit.backend.models.scenario_suites",
+    "ScenarioSuiteResponse": "pyrit.backend.models.scenario_suites",
+    "UpdateScenarioSuiteRequest": "pyrit.backend.models.scenario_suites",
     "ListRegisteredScenariosResponse": "pyrit.backend.models.scenarios",
+    "CreateScorerRequest": "pyrit.backend.models.scorers",
+    "ScorerListResponse": "pyrit.backend.models.scorers",
+    "ScorerTypeEntry": "pyrit.backend.models.scorers",
+    "ScorerTypeResponse": "pyrit.backend.models.scorers",
     "ScenarioRunListResponse": "pyrit.backend.models.scenarios",
     "ListRegisteredInitializersResponse": "pyrit.backend.models.initializers",
     "RegisterInitializerRequest": "pyrit.backend.models.initializers",

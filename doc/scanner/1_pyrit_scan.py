@@ -5,7 +5,7 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.19.1
+#       jupytext_version: 1.19.5
 # ---
 
 # %% [markdown]
@@ -46,6 +46,18 @@
 # !pyrit_scan list-scenarios
 
 # %% [markdown]
+# Use `list-operations` to find saved Operation names and IDs:
+#
+# ```shell
+# pyrit_scan list-operations
+# pyrit_scan run garak.encoding --target my_target --operation-id <UUID>
+# ```
+#
+# Use an ID returned by `list-operations`. Omitting `--operation-id` leaves the run
+# unassigned. `operation` in `--memory-labels` is deprecated and will be removed in 1.4.0.
+# Until then it links the run to the saved Operation with that name when one exists,
+# and is otherwise kept as a plain name.
+#
 # **Tip**: You can also surface user-defined scenarios. List your initializer script in the
 # `initialization_scripts` section of the config file the backend loads (see [here](../getting_started/pyrit_conf.md)).
 # The backend runs those scripts at startup and auto-discovers any `Scenario` subclasses they
@@ -120,13 +132,36 @@
 # - `--max-concurrency <int>`: Maximum number of concurrent attack executions
 # - `--max-retries <int>`: Maximum number of automatic retries if the scenario raises an exception
 # - `--memory-labels <json>`: Additional labels to apply to all attack runs (must be a JSON string with string keys and values)
+# - `--operation-id <UUID>`: Saved Operation ID for this run
 #
 # Dataset-backed scenarios can also select a supported dataset. Requested datasets are fetched
 # on demand, so a full dataset preload is not required:
 #
 # ```shell
-# pyrit_scan run garak.figstep --target openai_chat --dataset-names figstep_pro --max-dataset-size 1
+# pyrit_scan run garak.figstep --target openai_chat --datasets figstep_pro --max-total 1 --dataset-fetch if_missing
 # ```
+#
+# Scanner and shell share `--datasets name[:N|:all]`, `--max-per-dataset`, `--max-total`,
+# and `--dataset-fetch never|if_missing|always`. Source limits apply before the combined total.
+# Omitted, empty, or `default` keeps the scenario setting; `all` removes only its own cap.
+# `list-scenarios` displays allowed sources and defaults. Ingredient/compound scenarios
+# restrict controls to preserve their shaping. `--dataset-filters` works with either form.
+# Deprecated `--dataset-names` and `--max-dataset-size` cannot be mixed with the new flags.
+# Discovery, estimates, and resume never fetch. A new run prepares missing datasets or
+# explicitly refreshes them. For example:
+#
+# ```shell
+# pyrit_scan run garak.figstep --target openai_chat --datasets figstep_pro --max-total 1 --dataset-fetch always
+# ```
+#
+# `always` bypasses the provider cache and replaces the complete stored dataset, not only
+# the filtered or sampled objectives. Before any dataset write, fetched and retained sources
+# pass the configuration's filters, grouping, and validators without sampling. A fetch,
+# grouping, or validation failure keeps every selected dataset unchanged.
+# Replacement can remove manual edits and prevent older runs from resuming. A memory-only
+# dataset cannot refresh without a provider. Storage commits are per dataset: a later write
+# failure does not undo an earlier successful write. Explicit "Load datasets" in the GUI
+# remains missing-only and is disabled while a missing source is set to refresh on launch.
 #
 # Custom initialization scripts are loaded by the backend at startup: list them in the
 # `initialization_scripts` section of the config the server loads (paths are relative to your
@@ -182,7 +217,7 @@
 
 from pyrit.common import apply_defaults
 from pyrit.prompt_target.openai.openai_chat_target import OpenAIChatTarget
-from pyrit.scenario import DatasetAttackConfiguration, Scenario, ScenarioTechnique
+from pyrit.scenario import DatasetAttackConfiguration, DatasetSource, Scenario, ScenarioTechnique
 from pyrit.score import SelfAskRefusalScorer, TrueFalseInverterScorer
 from pyrit.setup import initialize_pyrit_async
 
@@ -206,7 +241,8 @@ class MyCustomScenario(Scenario):
             version=1,
             objective_scorer=TrueFalseInverterScorer(scorer=SelfAskRefusalScorer(chat_target=OpenAIChatTarget())),
             technique_class=MyCustomTechnique,
-            default_dataset_config=DatasetAttackConfiguration(dataset_names=["harmbench"]),
+            # Named sources default to 5 groups each; use max_per_dataset and max_total to set caps.
+            default_dataset_config=DatasetAttackConfiguration(sources=[DatasetSource(name="harmbench")]),
             scenario_result_id=scenario_result_id,
         )
         # ... your scenario-specific initialization code
@@ -236,7 +272,9 @@ MyCustomScenario()
 # # Run it with parameter overrides
 # pyrit_scan run my_custom_scenario --max-concurrency 10
 #
-# ```The scenario name is automatically converted from the class name (e.g., `MyCustomScenario` becomes `my_custom_scenario`).
+# ```
+#
+# The scenario name is automatically converted from the class name (e.g., `MyCustomScenario` becomes `my_custom_scenario`).
 #
 
 # %% [markdown]
@@ -249,23 +287,25 @@ MyCustomScenario()
 # pyrit_scan scenario-history 25       # last 25
 # ```
 #
-# Then inspect a run with `scenario-results` at the granularity you want via `--view`:
+# Then inspect a run with `scenario-results` at the granularity you want via `--view`, the output format (e.g., pretty, json, or html) via `--format`, and the output file via `--output`:
 #
 # ```shell
-# # Aggregate stats + per-group success rates (the default; same as the run summary)
+# # Aggregate stats + per-group success rates pretty printed (the default; same as the run summary)
 # pyrit_scan scenario-results <scenario_result_id>
 #
-# # One row per attack: id, technique, objective, outcome, turns, score
-# pyrit_scan scenario-results <scenario_result_id> --view attacks
+# # One row per attack: id, technique, objective, outcome, turns, score; saved down as a json file
+# pyrit_scan scenario-results <scenario_result_id> --view attacks --format json --output test_attack_results.json
 #
-# # Full message transcripts with the objective score per turn
-# pyrit_scan scenario-results <scenario_result_id> --view conversations
+# # `attacks` view + full message transcripts with the objective score per turn
+# pyrit_scan scenario-results <scenario_result_id> --view conversations --format pretty
 #
-# # Both: the attacks table followed by the transcripts
-# pyrit_scan scenario-results <scenario_result_id> --view full
+# # Both: the overview followed by the transcripts, saved down as a html report (html only supports full view)
+# pyrit_scan scenario-results <scenario_result_id> --view full --format html --output reports/html_report.html
 # ```
 #
-# `--view` picks *how much* detail per attack; `--attack-result-ids` picks *which* attacks (ids come from the `attacks` view); the two combine. Use `--limit` to cap how many attacks are shown; the `conversations` and `full` views default to 5 when you scope neither:
+# Each per-attack view lists the attempts counted in the overview, and adaptive attempts are labeled with the technique they used (for example, `crescendo`).
+#
+# `--view` picks *how much* detail per attack; `--attack-result-ids` picks *which* attacks (ids come from the `attacks` view); the two combine. Use `--limit` to cap how many attacks are shown; the `conversations` and `full` views default to 5 when you scope neither. (`--limit` is not applicable to `--format html` report.)
 #
 # ```shell
 # pyrit_scan scenario-results <id> --view conversations --attack-result-ids <attack_id> <attack_id>

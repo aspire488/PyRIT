@@ -73,7 +73,154 @@ Here are some examples:
 | **OpenAIChatTarget** (e.g., GPT-4)  | **Yes** (multi-turn + editable history)           | Designed for conversational prompts (system messages, conversation history, etc.).               |
 | **OpenAIImageTarget**               | **No**                                            | Used for image generation; does not manage conversation history.                                 |
 | **HTTPTarget**                      | **No**                                            | Generic HTTP target. Some apps might allow conversation history, but this target doesn't handle it. |
+| **A2ATarget**                       | **No** (multi-turn, but no editable history)     | Text-only Agent-to-Agent endpoints through the official a2a-sdk (v0.3 / v1.0).                |
 | **AzureBlobStorageTarget**          | **No**                                            | Used primarily for storage; not for conversation-based AI.                                       |
+
+## OpenAI SDK compatibility
+
+PyRIT supports OpenAI Python SDK 2.20 and later 2.x releases, and SDK 3.x.
+The upper bound excludes SDK 4 until it has been evaluated. The compatibility
+tests exercise both SDK lines with fabricated provider responses, including
+custom HTTP clients, authentication, errors, and binary responses.
+
+SDK 2 uses `httpx` by default; SDK 3 uses `httpx2`. The
+`httpx_client_kwargs` parameter keeps its existing name and forwards options to
+`AsyncOpenAI`, not to an HTTP client constructor. Numeric timeouts keep working:
+
+```python
+target = OpenAIChatTarget(
+    model_name="my-deployment",
+    endpoint="https://my-resource.openai.azure.com/openai/v1",
+    api_key="...",
+    httpx_client_kwargs={"timeout": 180},
+)
+```
+
+For a custom transport, proxy, TLS context, or event hook, construct an async
+HTTP client and pass it as `httpx_client_kwargs={"http_client": client}`.
+An `httpx.AsyncClient` works on both SDK lines using SDK 3's legacy-client
+compatibility layer. On SDK 3, `httpx2.AsyncClient` and
+`openai.DefaultAsyncHttpxClient` use the native HTTPX2 transport. Keep custom
+transport classes, request/response objects, and hooks in the same HTTP family
+as the client, and close caller-created clients when finished.
+
+The SDK 3 default transport uses the operating-system TLS trust store rather
+than HTTPX's `certifi` bundle. Install corporate or private CA certificates in
+that trust store, set `SSL_CERT_FILE` / `SSL_CERT_DIR`, or pass a client with
+an explicit TLS context. Catch SDK exceptions such as `openai.APITimeoutError`
+and `openai.APIConnectionError`, rather than assuming their underlying cause
+is always an HTTPX exception. See the upstream
+[HTTPX2 migration guide](https://github.com/openai/openai-python/blob/v3.29.0/httpx2.md).
+
+Use base URLs without the API operation path, for example `/openai/v1` rather
+than `/openai/deployments/.../chat/completions`. Pass deployment names through
+`model_name` and additional query parameters through
+`httpx_client_kwargs={"default_query": {"api-version": "..."}}`.
+The SDK owns trailing-slash normalization and appending the operation path.
+
+`OpenAIVideoTarget` retains the deprecated videos API for compatible endpoints.
+This does not restore availability of OpenAI's retired Sora service. SDK 3's
+deprecation warnings remain visible; type-check exceptions are limited to the
+specific SDK calls in that adapter.
+
+The default installation does not require LiteLLM and can resolve to SDK 3.
+The optional `litellm` and `all` extras retain stable LiteLLM releases. A stable
+LiteLLM release that requires `openai<3` selects SDK 2, which PyRIT also supports;
+there is no need to install a development build to use these extras.
+The shared `uv.lock` therefore retains SDK 2 to satisfy all extras. CI tests
+SDK 2 and 3 without LiteLLM, and stable LiteLLM with SDK 2. Ordinary package
+installations resolve the selected extras independently of this development lock.
+
+## A2A agents
+
+Install the optional client with `pip install "pyrit[a2a]"` (also included in
+`pyrit[all]`). `A2ATarget` uses the official `a2a-sdk` 1.x client for JSON-RPC.
+Set `protocol_version="0.3"` (the default) or `"1.0"` for a known endpoint.
+Set `"auto"` to discover the agent card. Discovery errors are not hidden by
+a fallback to another protocol. Use `agent_card_path` for a non-standard
+relative card path.
+
+The adapter sends one text piece per turn. The agent owns its context and
+history. The target cannot edit or replay that history, send system-role
+messages, enforce native JSON output, or send audio, images, or files.
+Custom capabilities cannot enable these unsupported features or disable
+multi-turn support. Disabling it would squash local history while the agent
+retains the same history. To restore an
+existing upstream context on a new target instance, use
+`set_conversation_context`. A local history without an upstream context ID
+is rejected. `reset_conversation_async` forgets the local mapping; it does
+not delete remote state. Sends and resets for the same conversation are
+serialized. Different conversations can run concurrently.
+`set_conversation_context` raises an error if that conversation is in use.
+
+The target retries submission only after an explicit HTTP 429. Retries use
+the same A2A message ID. Rate-limit errors during polling retry only the poll.
+Polling honors `Retry-After` (seconds or HTTP date), with exponential backoff
+when that header is absent or invalid. The polling deadline bounds these waits.
+`max_requests_per_minute` applies to submission attempts and task polls, not
+agent-card discovery.
+Empty results, task failures, and agent errors that mention a downstream
+rate limit do not cause automatic resubmission. A polling timeout does not
+cancel the remote task. Do not blindly resubmit an action after a timeout.
+`request_timeout_seconds` sets the HTTPX connect, read, write, and pool
+timeouts and defaults to `task_timeout_seconds`. These are per-phase
+timeouts, not a total turn deadline. Instead, pass HTTPX `timeout` for
+per-phase settings or `timeout=None` to disable HTTP timeouts. Do not pass
+both timeout options. Timeouts must be finite and positive.
+`task_timeout_seconds` is a separate deadline that starts after submission
+returns a pending task. It bounds polling, rate-limit waits, and in-flight
+poll requests, even with `timeout=None`. `poll_interval_seconds` must be
+finite and non-negative.
+
+Identifiers include the endpoint, requested protocol, card path, and optional
+`routing_identifier`. Set this non-secret deployment label when HTTP headers
+select a different agent at the same endpoint. Do not put tokens in the URL,
+card path, or routing label. Credentials, HTTP headers, and timeout settings
+are not copied into identifier parameters.
+
+`auth_token` accepts a static token or an async callable that returns a token.
+The callable runs before each HTTP request, including discovery, submission
+retries, and polls. Use a provider that caches tokens and refreshes them
+before expiry. Do not combine `auth_token` with HTTPX `auth` or an
+`Authorization` header. Custom HTTPX authentication is supported when
+`auth_token` is not set.
+
+For Foundry, keep the credential open for the full target operation:
+
+```python
+from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
+from pyrit.prompt_target import A2ATarget
+
+async with DefaultAzureCredential() as credential:
+    token_provider = get_bearer_token_provider(credential, "https://ai.azure.com/.default")
+    target = A2ATarget(
+        endpoint=agent_endpoint,
+        protocol_version="auto",
+        agent_card_path="agentCard/v1.0",
+        auth_token=token_provider,
+    )
+    responses = await target.send_prompt_async(message=message)
+```
+
+### A2A integration tests
+
+The local tests run an official SDK server on an ephemeral loopback port.
+They cover 0.3 and 1.0, discovery, persisted multi-turn history, task
+continuation, failure, and prevention of duplicate submissions. From a
+development environment with the `all` extra, set `RUN_ALL_TESTS=true` and run:
+
+```text
+uv run pytest tests/integration/targets/test_a2a_target_integration.py -k "not foundry"
+```
+
+The separate Foundry test also requires `RUN_ALL_TESTS=true` and
+`A2A_FOUNDRY_ENDPOINT`. It uses `A2A_FOUNDRY_AUTH_TOKEN` if supplied; otherwise,
+it uses a refreshable Entra token provider through `DefaultAzureCredential` for
+`https://ai.azure.com/.default`. The identity must have access to the agent
+(for example, the Agent Consumer role). `A2A_FOUNDRY_CARD_PATH`
+defaults to `agentCard/v1.0`; set it to
+`agentCard/v0.3` for a preview endpoint. The test requires a successful text
+response, not just a non-empty error. It does not create Azure resources.
 
 ## Target Capabilities
 
@@ -103,6 +250,10 @@ A `TargetConfiguration` composes three concerns:
 Each target class defines defaults; instances can override individual capabilities when they depend on deployment configuration (e.g. `HTTPTarget`, `PlaywrightTarget`).
 
 For well-known underlying models, you can look up a profile with `get_known_capabilities(underlying_model="gpt-4o")` from `pyrit.prompt_target`.
+
+Tool-call history uses the existing `function_call` and `function_call_output` input
+modalities. These describe acceptance of prior calls and results, not tool execution.
+See [Target Capabilities](./6_1_target_capabilities.ipynb) for examples.
 
 ### How consumers use capabilities
 

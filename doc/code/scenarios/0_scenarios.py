@@ -67,8 +67,12 @@
 #      Matrix-shaped scenarios delegate to `build_matrix_atomic_attacks(context=...)` in one line.
 #
 # 3. **Default Dataset**: Pass `default_dataset_config=` to `super().__init__()` to specify the datasets your scenario uses out of the box.
-#    - Returns a `DatasetConfiguration` with one or more named datasets (e.g., `DatasetConfiguration(dataset_names=["my_dataset"])`)
-#    - Users can override this at runtime via `--dataset-names` in the CLI or by passing a custom `dataset_config` programmatically
+#    - Returns a `DatasetAttackConfiguration` with named sources (e.g., `sources=[DatasetSource(name="my_dataset")]`)
+#    - Users select sources with `--datasets name[:N|:all]`, or pass `dataset_overrides=ScenarioDatasetRequest(...)` in `set_params_from_args`. A custom `dataset_config` replaces the default; overrides apply on top.
+#    - Named sources select at most 5 attack groups per dataset by default; `max_total` caps the union. For any limit, omitted/`None`/empty/`"default"` uses the default; `"all"` removes that limit.
+#    - The deprecated `max_dataset_size` is an exact alias for `max_total`, not a way to disable source caps. To keep the old total-only selection, use `max_per_dataset="all", max_total=10`; to remove both caps, set both to `"all"`. `None` now uses the default, not unlimited selection.
+#    - New runs prepare missing registered datasets once; reads, estimates, and resume never fetch
+#    - Scenarios declare allowed source selections and limit controls. Estimates return resolved `dataset_defaults` and `effective_datasets` separately from requested edits. Name-only selection preserves existing source caps and fetch policies.
 #
 # 4. **Constructor**: Use `@apply_defaults` decorator and call `super().__init__()` with scenario metadata:
 #    - `name`: Descriptive name for your scenario
@@ -78,9 +82,10 @@
 #    - `objective_scorer`: The scorer used to judge responses
 #    - `scenario_result_id`: Optional ID to resume an existing scenario (optional)
 #
-# 5. **Initialization**: Call `await scenario.initialize_async()` to populate atomic attacks:
+# 5. **Initialization**: Set run inputs with `scenario.set_params_from_args(args={...})`,
+#    then call the argument-free `await scenario.initialize_async()` to populate atomic attacks:
 #    - `objective_target`: The target system being tested (required)
-#    - `scenario_techniques`: List of techniques to execute (optional, defaults to ALL)
+#    - `scenario_techniques`: List of techniques to execute (optional, uses the catalog's default)
 #    - `max_concurrency`: Number of concurrent operations (default: 4)
 #    - `max_retries`: Number of retry attempts on failure (default: 0)
 #    - `memory_labels`: Optional labels for tracking (optional)
@@ -93,10 +98,15 @@
 # implement `_build_atomic_attacks_async(context)`. Matrix-shaped scenarios delegate to the
 # `build_matrix_atomic_attacks` helper, which builds atomic attacks automatically from the
 # registered attack techniques.
+# Common construction inputs, including per-technique converters, come from
+# `context`, including inside nested helper methods. Scenario-specific scorers
+# and other construction options stay on the scenario.
 # %%
 from pyrit.common import apply_defaults
+from pyrit.common.async_compatibility import run_legacy_sync_async
 from pyrit.scenario import (
-    DatasetConfiguration,
+    DatasetAttackConfiguration,
+    DatasetSource,
     Scenario,
     ScenarioTechnique,
 )
@@ -142,7 +152,9 @@ class MyScenario(Scenario):
             version=self.VERSION,
             objective_scorer=self._objective_scorer,
             technique_class=MyTechnique,
-            default_dataset_config=DatasetConfiguration(dataset_names=["dataset_name"], max_dataset_size=4),
+            default_dataset_config=DatasetAttackConfiguration(
+                sources=[DatasetSource(name="dataset_name")], max_total=4
+            ),
             scenario_result_id=scenario_result_id,
         )
 
@@ -150,7 +162,8 @@ class MyScenario(Scenario):
     # to build_matrix_atomic_attacks; pass display_group_fn to customize result grouping
     # (default groups by technique; here we group by dataset instead).
     async def _build_atomic_attacks_async(self, *, context):
-        return build_matrix_atomic_attacks(
+        return await run_legacy_sync_async(
+            build_matrix_atomic_attacks,
             context=context,
             objective_scorer=self._objective_scorer,
             display_group_fn=lambda combo: combo.dataset_name,

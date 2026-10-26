@@ -23,10 +23,76 @@ _EAGER_PACKAGE_EXCEPTIONS = frozenset(
 
 _LAZY_IMPORT_SPOT_CHECKS = [
     (
+        "pyrit._code_execution",
+        "SandboxClient",
+        "pyrit._code_execution.client",
+        "pyrit._code_execution.docker_client",
+    ),
+    (
+        "pyrit._code_execution",
+        "DockerSandboxClient",
+        "pyrit._code_execution.docker_client",
+        "pyrit.score",
+    ),
+    (
+        "pyrit.analytics",
+        "compute_technique_stats_async",
+        "pyrit.analytics.technique_analysis",
+        "pyrit.analytics.attack_result_analytics",
+    ),
+    (
+        "pyrit.analytics",
+        "compute_outcome_statistics",
+        "pyrit.analytics.outcome_statistics",
+        "pyrit.memory.attack_analytics",
+    ),
+    (
+        "pyrit.models",
+        "OutcomeStatistics",
+        "pyrit.models.analytics",
+        "pyrit.analytics.outcome_statistics",
+    ),
+    (
+        "pyrit.analytics",
+        "AttackResultAnalytics",
+        "pyrit.analytics.attack_result_analytics",
+        "pyrit.analytics.conversation_analytics",
+    ),
+    (
+        "pyrit.analytics",
+        "AttackStats",
+        "pyrit.analytics.result_analysis",
+        "pyrit.analytics.attack_result_analytics",
+    ),
+    (
+        "pyrit.registry",
+        "AttackRegistry",
+        "pyrit.registry.components.attack_registry",
+        "pyrit.executor.attack",
+    ),
+    (
+        "pyrit.registry.components",
+        "AttackRegistry",
+        "pyrit.registry.components.attack_registry",
+        "pyrit.executor.attack",
+    ),
+    (
         "pyrit.models",
         "Message",
         "pyrit.models.messages.message",
         "pyrit.models.question_answering",
+    ),
+    (
+        "pyrit.models",
+        "SeedDatasetSummary",
+        "pyrit.models.seeds.seed_dataset_summary",
+        "pyrit.memory",
+    ),
+    (
+        "pyrit.models",
+        "SeedRecord",
+        "pyrit.models.seeds.seed_record",
+        "pyrit.memory",
     ),
     (
         "pyrit.models.catalog",
@@ -63,6 +129,12 @@ _LAZY_IMPORT_SPOT_CHECKS = [
         "Seed",
         "pyrit.models.seeds.seed",
         "pyrit.models.seeds.yaml_seed_loader",
+    ),
+    (
+        "pyrit.models.seeds",
+        "SeedDatasetSummary",
+        "pyrit.models.seeds.seed_dataset_summary",
+        "pyrit.memory",
     ),
     (
         "pyrit.models.target",
@@ -110,6 +182,12 @@ _LAZY_IMPORT_SPOT_CHECKS = [
         "pyrit.score",
         "SubStringScorer",
         "pyrit.score.true_false.substring_scorer",
+        "pyrit.score.true_false.audio_true_false_scorer",
+    ),
+    (
+        "pyrit.score",
+        "CategoryConflictPolicy",
+        "pyrit.score.response_handler",
         "pyrit.score.true_false.audio_true_false_scorer",
     ),
     (
@@ -354,6 +432,91 @@ def test_lazy_packages_do_not_load_child_modules() -> None:
     )
 
 
+def test_analytics_foundations_do_not_load_higher_layers() -> None:
+    _assert_subprocess_succeeds(
+        """
+        import importlib
+        import sys
+
+        import pyrit.common.pagination
+        assert not any(name.startswith("pyrit.models") for name in sys.modules)
+
+        import pyrit.models
+        assert "pyrit.models.analytics" not in sys.modules
+        names = [
+            name for name, module in pyrit.models._LAZY_EXPORTS.items()
+            if module == "pyrit.models.analytics"
+        ]
+        assert len(names) == 22
+        assert "OutcomeStatistics" in names
+        for name in names:
+            exported = getattr(pyrit.models, name)
+            assert exported is getattr(importlib.import_module("pyrit.models.analytics"), name)
+            assert pyrit.models.__dict__[name] is exported
+        assert pyrit.models.OutcomeStatistics is pyrit.models.AttackAnalyticsStatistics
+
+        forbidden = (
+            "pyrit.analytics", "pyrit.backend", "pyrit.memory", "pyrit.executor",
+            "pyrit.scenario", "pyrit.prompt_target", "pyrit.score", "fastapi", "sqlalchemy",
+        )
+        loaded = [
+            name for name in sys.modules
+            if any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden)
+        ]
+        assert not loaded, loaded
+        """
+    )
+
+
+def test_code_execution_is_independent_of_component_layers() -> None:
+    _assert_subprocess_succeeds(
+        """
+        import importlib.util
+        import sys
+        import pyrit.models
+        import pyrit.models.code_execution as execution_models
+        from pyrit._code_execution import DockerRuntimeProfile, DockerSandboxClient, SandboxClient
+        from pyrit.models.code_execution import (
+            _ProgramExecutionEvent, _ProgramInvocation, _RuntimeProfileName, _SandboxRun,
+        )
+
+        for name in ("_ProgramExecutionEvent", "_ProgramInvocation", "_RuntimeProfileName", "_SandboxRun"):
+            assert name not in pyrit.models.__all__
+            assert not hasattr(pyrit.models, name)
+            public_name = name.removeprefix("_")
+            assert public_name not in pyrit.models.__all__
+            assert not hasattr(pyrit.models, public_name)
+            assert not hasattr(execution_models, public_name)
+
+        client = DockerSandboxClient(
+            profiles={"python": DockerRuntimeProfile(image="python@sha256:" + "a" * 64, command=("python3",))}
+        )
+        assert isinstance(client, SandboxClient)
+        assert client.get_runtime_profile_names() == frozenset({"python"})
+        assert client.get_identifier().class_module == "pyrit._code_execution.docker_client"
+        assert importlib.util.find_spec("pyrit.code_execution") is None
+        event = _ProgramExecutionEvent(
+            invocation_index=0, runtime_profile_name="python",
+            exit_code=0, stdout="result", duration_ms=1,
+        )
+        assert event.resolved_command is None
+        assert _SandboxRun(events=(event,)).events[0].stdout == "result"
+        assert _ProgramInvocation(stdin="input").stdin == "input"
+
+        forbidden = (
+            "pyrit.score", "pyrit.models.score", "pyrit.memory", "pyrit.executor",
+            "pyrit.prompt_target", "pyrit.converter", "pyrit.datasets", "pyrit.scenario",
+            "pyrit.backend", "sqlalchemy",
+        )
+        loaded = [
+            name for name in sys.modules
+            if any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden)
+        ]
+        assert not loaded, loaded
+        """
+    )
+
+
 def test_observation_acquisition_and_scorer_do_not_load_otel_sdk() -> None:
     _assert_subprocess_succeeds(
         """
@@ -550,9 +713,10 @@ def test_dynamic_scenario_techniques_reject_unknown_export() -> None:
         dynamic_techniques.__getattr__("UnknownTechnique")
 
 
-def test_dynamic_scenario_technique_resolves_and_caches() -> None:
+def test_dynamic_scenario_technique_delegates_to_builder() -> None:
     dynamic_techniques = importlib.import_module("pyrit.scenario.scenarios._dynamic_techniques")
-    builder = MagicMock(return_value=object())
+    technique, replacement = object(), object()
+    builder = MagicMock(side_effect=[technique, replacement])
     builder_module = MagicMock()
     builder_module.build = builder
 
@@ -563,11 +727,43 @@ def test_dynamic_scenario_technique_resolves_and_caches() -> None:
         ),
         patch.object(dynamic_techniques, "import_module", return_value=builder_module),
     ):
-        technique = dynamic_techniques.__getattr__("TestTechnique")
+        assert dynamic_techniques.TestTechnique is technique
+        assert dynamic_techniques.TestTechnique is replacement
 
-    assert dynamic_techniques.TestTechnique is technique
-    builder.assert_called_once_with()
-    dynamic_techniques.__dict__.pop("TestTechnique")
+    assert builder.call_count == 2
+    assert "TestTechnique" not in dynamic_techniques.__dict__
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "pyrit.scenario.scenarios._dynamic_techniques",
+        "pyrit.scenario.scenarios.airt",
+        "pyrit.scenario.airt",
+    ],
+)
+def test_dynamic_scenario_technique_exports_refresh_after_registration(
+    *, patch_central_database: object, module_name: str
+) -> None:
+    from pyrit.executor.attack import PromptSendingAttack
+    from pyrit.registry import AttackTechniqueRegistry, Registry
+    from pyrit.scenario import AttackTechniqueFactory
+
+    exports = importlib.import_module(module_name)
+    with patch.dict(Registry._singletons, {}, clear=True):
+        registry = AttackTechniqueRegistry.get_registry_singleton()
+        registry.register_from_factories([AttackTechniqueFactory(name="base", attack_class=PromptSendingAttack)])
+        before = exports.RapidResponseTechnique
+        assert exports.RapidResponseTechnique is before
+
+        registry.instances.register_runtime(AttackTechniqueFactory(name="new", attack_class=PromptSendingAttack))
+        current = exports.RapidResponseTechnique
+
+        assert current is not before
+        assert exports.RapidResponseTechnique is current
+        assert {technique.value for technique in before.get_all_techniques()} == {"base"}
+        assert {technique.value for technique in current.get_all_techniques()} == {"base", "new"}
+        assert "RapidResponseTechnique" not in exports.__dict__
 
 
 def test_scenario_registry_materializes_builtin_catalog() -> None:

@@ -119,6 +119,14 @@ export const useScenarioDetailStyles = makeStyles({
     flexDirection: 'column',
     gap: tokens.spacingVerticalM,
   },
+  conversationActions: {
+    display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: tokens.spacingHorizontalS,
+  },
+  conversationSurface: {
+    width: '90vw', maxWidth: '75rem', height: '85vh', minWidth: 0,
+    '& > div': { height: '100%', minHeight: 0 },
+  },
+  conversationContent: { display: 'flex', minHeight: 0, overflow: 'hidden' },
   touchTarget: {
     ...mobileTouchTarget,
   },
@@ -226,6 +234,11 @@ export const useScenarioDetailStyles = makeStyles({
     display: 'flex',
     flexDirection: 'column',
     gap: tokens.spacingVerticalXXS,
+  },
+  techniquePreview: {
+    whiteSpace: 'pre-wrap',
+    overflowWrap: 'anywhere',
+    maxWidth: '100%',
   },
   previewBadges: {
     display: 'flex',

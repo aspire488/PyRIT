@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 
 from pyrit.models.identifiers.component_identifier import ComponentIdentifier, config_hash
 from pyrit.models.identifiers.evaluation_markers import Evaluate
@@ -23,7 +23,8 @@ class SeedIdentifier(ComponentIdentifier):
 
     Promotes the seed properties that define its identity: the raw value, its
     SHA256, the originating dataset, the data type, and whether it is a general
-    technique.
+    technique. Objective conditions and named adversarial prompts are retained
+    in the full identifier JSON. Seeds without them retain their existing identity.
     """
 
     #: The seed's raw value.
@@ -38,7 +39,7 @@ class SeedIdentifier(ComponentIdentifier):
     is_general_technique: Annotated[bool | None, Evaluate.Include()] = None
 
     @classmethod
-    def from_seed(cls, seed: Seed) -> SeedIdentifier:
+    def from_seed(cls, seed: Seed[Any]) -> SeedIdentifier:
         """
         Build a SeedIdentifier from a seed's behavioral properties.
 
@@ -54,12 +55,33 @@ class SeedIdentifier(ComponentIdentifier):
         """
         return cls.of(
             seed,
+            params=cls.get_behavioral_parameters(seed) or None,
             value=seed.value,
             value_sha256=seed.value_sha256,
             data_type=seed.data_type,
             dataset_name=seed.dataset_name,
             is_general_technique=seed.is_general_technique,
         )
+
+    @staticmethod
+    def get_behavioral_parameters(seed: Seed[Any]) -> dict[str, Any]:
+        """
+        Project conditions and named prompts for seed identity and storage.
+
+        Args:
+            seed (Seed): The seed whose behavioral inputs are projected.
+
+        Returns:
+            dict[str, Any]: Canonical inputs, excluding descriptive metadata and prompt IDs.
+        """
+        from pyrit.models.seeds.adversarial_prompts import AdversarialPrompts
+
+        conditions = seed.model_dump(mode="json", include={"conditions"}).get("conditions")
+        params = {"conditions": conditions} if conditions else {}
+        adversarial_prompts = AdversarialPrompts.from_metadata(seed.metadata)
+        if adversarial_prompts is not None:
+            params["adversarial_prompts"] = adversarial_prompts.identity
+        return params
 
 
 def compute_seed_group_hash(seed_identifiers: Sequence[SeedIdentifier]) -> str:

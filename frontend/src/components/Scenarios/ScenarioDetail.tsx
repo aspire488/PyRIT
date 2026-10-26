@@ -1,4 +1,4 @@
-import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { type FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import {
   Badge,
@@ -11,12 +11,13 @@ import {
   DialogSurface,
   DialogTitle,
   Field,
-  Input,
+  Radio,
   MessageBar,
   MessageBarBody,
   mergeClasses,
   Select,
   Spinner,
+  Switch,
   Text,
   Tooltip,
   ToggleButton,
@@ -27,9 +28,16 @@ import {
   InfoRegular,
   SettingsRegular,
 } from '@fluentui/react-icons'
-import { Link, useNavigate, useParams } from 'react-router'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 
 import MarkdownContent from '@/components/Markdown/MarkdownContent'
+import ConversationEditor, { type ConversationEditorHandle } from '@/components/Chat/ConversationEditor'
+import TargetSelect from '@/components/Config/TargetSelect'
+import TechniqueEditor from '@/components/Techniques/TechniqueEditor'
+import { useConversationDraft } from '@/hooks/useConversationDraft'
+import { useRuntime } from '@/hooks/useRuntime'
+import { useRunTechniqueEditor } from '@/hooks/useRunTechniqueEditor'
+import { useScenarioDatasets } from '@/hooks/useScenarioDatasets'
 import ParameterField from '@/components/Parameters/ParameterField'
 import SingleStepSpinButton from '@/components/Parameters/SingleStepSpinButton'
 import {
@@ -38,9 +46,10 @@ import {
   type ParameterFormValue,
 } from '@/components/Parameters/parameterForm'
 import type { ViewName } from '@/components/Sidebar/Navigation'
-import { scenariosApi, targetsApi } from '@/services/api'
+import { attacksApi, scenariosApi } from '@/services/api'
 import { toApiError } from '@/services/errors'
 import type {
+  AddMessageResponse,
   Parameter,
   RegisteredScenario,
   RunScenarioRequest,
@@ -49,24 +58,28 @@ import type {
   ScenarioRunSizeEstimateRequest,
   ScenarioRunEstimateState,
   ScenarioTechniqueSummary,
+  ScenarioDatasetRequest,
+  ScenarioDatasetSettings,
+  ScenarioDatasetOptions,
+  ScenarioRunSizeEstimateResponse,
   TargetInstance,
+  TechniqueOverride,
 } from '@/types'
-import { fetchAllPages } from '@/utils/fetchAllPages'
+import { newDraftMessage, toConversationDraft } from '@/utils/conversationDraft'
 import { routerPathParamValue, scenarioRunRoutePath } from '@/utils/routeParams'
-import { targetModelName } from '@/utils/targetIdentity'
+import { sameTarget, targetModelName } from '@/utils/targetIdentity'
 
 import { useScenarioDetailStyles } from './ScenarioDetail.styles'
 import { ScenarioRunEstimateDetails } from './ScenarioRunEstimate'
+import { scenarioDatasetDefaults, scenarioDatasetOptions } from './datasetPresentation'
 import { normalizeScenarioMarkdown } from './scenarioMarkdown'
 import { mapScenarioRunEstimate } from './scenarioRunEstimateAdapter'
 import { techniqueSetName } from './scenarioTechniqueSets'
-
-/** Items requested per target page while paging through the full list. */
-const TARGET_PAGE_SIZE = 200
+import ScenarioDatasetTable from './ScenarioDatasetTable'
 
 /**
- * Common/opaque parameters every scenario declares via
- * `Scenario._common_scenario_parameters` — the launch form already exposes a
+ * Common/opaque parameters the base scenario declares via
+ * `Scenario._common_scenario_parameters` — the launch form exposes a
  * purpose-built control for each of these (target, techniques, datasets,
  * labels, concurrency, retries, baseline), and `technique_converters` has no
  * UI at all. They're hidden from the dynamic scenario-specific parameter list.
@@ -75,7 +88,9 @@ const COMMON_SCENARIO_PARAMETER_NAMES = new Set([
   'objective_target',
   'scenario_techniques',
   'technique_converters',
+  'local_technique_factory',
   'dataset_config',
+  'dataset_overrides',
   'memory_labels',
   'max_concurrency',
   'max_retries',
@@ -89,31 +104,18 @@ const MAX_MAX_RETRIES = 20
 const DEFAULT_MAX_CONCURRENCY = 10
 const DEFAULT_MAX_RETRIES = 0
 const ESTIMATE_DEBOUNCE_MS = 300
+const CONVERSATION_PARAMETER_NAMES = new Set(['prepended_conversation_id', 'apply_converters_to_prepended_history'])
+const OBJECTIVE_PARAMETER_NAMES = new Set(['objective', 'harm_categories'])
+
+function supportsParameter(scenario: RegisteredScenario, name: string): boolean {
+  return scenario.supported_parameter_names.includes(name)
+}
 
 function targetOptionLabel(target: TargetInstance): string {
   const modelName = targetModelName(target)
   return modelName
     ? `${target.target_registry_name} (${modelName})`
     : target.target_registry_name
-}
-
-function defaultMaxDatasetSize(scenario: RegisteredScenario): string {
-  const datasets = scenario.default_run_size.datasets
-  if (datasets.length === 0) {
-    return ''
-  }
-
-  for (const dataset of datasets) {
-    if (dataset.configured_caps.length === 0) {
-      return ''
-    }
-  }
-
-  const selectedGroupCount = datasets.reduce(
-    (total, dataset) => total + dataset.selected_seed_group_count,
-    0,
-  )
-  return selectedGroupCount > 0 ? String(selectedGroupCount) : ''
 }
 
 /** Resolves a Fluent `SpinButton` change event to a numeric value, preferring the parsed `value` over the raw `displayValue`. */
@@ -164,13 +166,6 @@ const BASELINE_TECHNIQUE: ScenarioTechniqueSummary = {
   tags: ['baseline', 'single_turn'],
 }
 
-function parseDatasetNames(datasetOverride: string): string[] {
-  return datasetOverride
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0)
-}
-
 function formatParameterPreview(value: ParameterFormValue | undefined): string {
   if (Array.isArray(value)) {
     return value.length > 0 ? value.join(', ') : 'Not set'
@@ -211,18 +206,19 @@ function estimateFromState(state: ScenarioRunEstimateState): ScenarioRunEstimate
 function formatAtomicAttackCount(state: ScenarioRunEstimateState): string {
   const estimate = estimateFromState(state)
   if (!estimate) {
-    return state.status === 'loading' ? 'Calculating...' : 'Unavailable'
+    return state.status === 'loading' ? 'Calculating...' : 'Unknown'
   }
+  const prefix = estimate.approximate ? 'About ' : ''
   if (estimate.total !== null) {
-    return estimate.total.toLocaleString()
+    return `${estimate.approximate ? 'Up to ' : ''}${estimate.total.toLocaleString()}`
   }
   if (estimate.minimum != null && estimate.maximum != null) {
     return estimate.minimum === estimate.maximum
-      ? estimate.minimum.toLocaleString()
-      : `${estimate.minimum.toLocaleString()}-${estimate.maximum.toLocaleString()}`
+      ? `${prefix}${estimate.minimum.toLocaleString()}`
+      : `${prefix}${estimate.minimum.toLocaleString()}-${estimate.maximum.toLocaleString()}`
   }
   if (estimate.minimum != null) {
-    return `At least ${estimate.minimum.toLocaleString()}`
+    return `At least ${prefix.toLowerCase()}${estimate.minimum.toLocaleString()}`
   }
   if (estimate.maximum != null) {
     return `Up to ${estimate.maximum.toLocaleString()}`
@@ -245,17 +241,20 @@ function estimateNotes(state: ScenarioRunEstimateState): string | null {
 interface BuildEstimateRequestInput {
   scenario: RegisteredScenario
   targetName: string
+  adversarialTargetName: string
   techniques: string[]
   dynamicParameters: Parameter[]
   scenarioParamValues: Record<string, ParameterFormValue>
-  datasetOverride: string
-  maxDatasetSize: string
-  harmCategoriesFilter: string
-  dataTypesFilter: string
+  datasetEdits: ScenarioDatasetRequest
+  datasetError: string | null
   includeBaseline: boolean
+  techniqueOverride?: TechniqueOverride
+  techniqueEditError?: string
+  supportsPrependedConversation?: boolean
 }
 
 interface BuildRunRequestInput extends BuildEstimateRequestInput {
+  operationId: string | null
   maxConcurrency: number
   maxRetries: number
   labels: Record<string, string>
@@ -291,6 +290,7 @@ type EstimateRequestState =
       status: 'resolved'
       requestKey: string
       result: ScenarioRunEstimateResult
+      datasetSettings?: ScenarioDatasetSettings
     }
   | {
       status: 'error'
@@ -299,59 +299,62 @@ type EstimateRequestState =
     }
 
 function buildEstimateRequest({
+  scenario,
   targetName,
+  adversarialTargetName,
   techniques,
   dynamicParameters,
   scenarioParamValues,
-  datasetOverride,
-  maxDatasetSize,
-  harmCategoriesFilter,
-  dataTypesFilter,
+  datasetEdits,
+  datasetError,
   includeBaseline,
+  techniqueOverride,
+  techniqueEditError,
+  supportsPrependedConversation = true,
 }: BuildEstimateRequestInput): BuildEstimateRequestResult {
-  if (techniques.length === 0) {
+  if (techniqueEditError) return { ok: false, error: techniqueEditError }
+  if (supportsParameter(scenario, 'scenario_techniques') && techniques.length === 0) {
     return { ok: false, error: 'Select at least one technique.' }
+  }
+  if (supportsParameter(scenario, 'scenario_techniques')
+    && scenario.max_concrete_techniques != null && techniques.length > scenario.max_concrete_techniques) {
+    return { ok: false, error: `Select at most ${scenario.max_concrete_techniques} concrete technique(s).` }
   }
 
   let scenarioParams: Record<string, unknown> | null = null
   if (dynamicParameters.length > 0) {
-    const result = buildParametersFromForm(dynamicParameters, scenarioParamValues)
+    const history = scenarioParamValues.prepended_conversation_id
+    if (!supportsPrependedConversation && typeof history === 'string' && history.trim()) {
+      return { ok: false, error: 'This technique does not support a prepended conversation. Clear the saved conversation before launch.' }
+    }
+    const result = buildParametersFromForm(
+      dynamicParameters.filter((parameter) => supportsPrependedConversation || !CONVERSATION_PARAMETER_NAMES.has(parameter.name)),
+      scenarioParamValues,
+    )
     if (!result.ok) {
       return result
     }
     scenarioParams = result.parameters
   }
 
-  let maxDatasetSizeValue: number | undefined
-  const trimmedMaxDatasetSize = maxDatasetSize.trim()
-  if (trimmedMaxDatasetSize.length > 0) {
-    const parsed = Number(trimmedMaxDatasetSize)
-    if (!Number.isInteger(parsed) || parsed < 1) {
-      return { ok: false, error: 'Max dataset size must be a positive integer.' }
-    }
-    maxDatasetSizeValue = parsed
+  const supportsDatasets = supportsParameter(scenario, 'dataset_config')
+  if (supportsDatasets && datasetError) return { ok: false, error: datasetError }
+  const request: ScenarioRunSizeEstimateRequest = {}
+  if (techniqueOverride) request.technique_override = techniqueOverride
+  if (supportsParameter(scenario, 'scenario_techniques')) {
+    request.techniques = techniques
   }
-  const datasetNames = parseDatasetNames(datasetOverride)
-  const request: ScenarioRunSizeEstimateRequest = {
-    techniques,
-    include_baseline: includeBaseline,
+  if (supportsParameter(scenario, 'include_baseline')) {
+    request.include_baseline = includeBaseline
   }
-  if (targetName) {
+  if (supportsParameter(scenario, 'objective_target') && targetName) {
     request.target_name = targetName
   }
-  if (datasetNames.length > 0) {
-    request.dataset_names = datasetNames
+  if (scenario.uses_default_adversarial_target && adversarialTargetName) {
+    request.adversarial_target_name = adversarialTargetName
   }
-  if (maxDatasetSizeValue !== undefined) {
-    request.max_dataset_size = maxDatasetSizeValue
-  }
-  const harmCategories = parseDatasetNames(harmCategoriesFilter)
-  const dataTypes = parseDatasetNames(dataTypesFilter)
-  if (harmCategories.length > 0 || dataTypes.length > 0) {
-    request.dataset_filters = {
-      ...(harmCategories.length > 0 ? { harm_categories: harmCategories } : {}),
-      ...(dataTypes.length > 0 ? { data_types: dataTypes } : {}),
-    }
+  if (supportsDatasets && Object.keys(datasetEdits).length > 0) {
+    request.datasets = datasetEdits
   }
   if (scenarioParams) {
     request.scenario_params = scenarioParams
@@ -360,7 +363,7 @@ function buildEstimateRequest({
 }
 
 function buildRunRequest(input: BuildRunRequestInput): BuildRunRequestResult {
-  if (!input.targetName) {
+  if (supportsParameter(input.scenario, 'objective_target') && !input.targetName) {
     return { ok: false, error: 'Select a target.' }
   }
   const estimateResult = buildEstimateRequest(input)
@@ -368,9 +371,11 @@ function buildRunRequest(input: BuildRunRequestInput): BuildRunRequestResult {
     return estimateResult
   }
   if (
-    !Number.isInteger(input.maxConcurrency)
-    || input.maxConcurrency < MIN_MAX_CONCURRENCY
-    || input.maxConcurrency > MAX_MAX_CONCURRENCY
+    supportsParameter(input.scenario, 'max_concurrency') && (
+      !Number.isInteger(input.maxConcurrency)
+      || input.maxConcurrency < MIN_MAX_CONCURRENCY
+      || input.maxConcurrency > MAX_MAX_CONCURRENCY
+    )
   ) {
     return {
       ok: false,
@@ -378,9 +383,11 @@ function buildRunRequest(input: BuildRunRequestInput): BuildRunRequestResult {
     }
   }
   if (
-    !Number.isInteger(input.maxRetries)
-    || input.maxRetries < MIN_MAX_RETRIES
-    || input.maxRetries > MAX_MAX_RETRIES
+    supportsParameter(input.scenario, 'max_retries') && (
+      !Number.isInteger(input.maxRetries)
+      || input.maxRetries < MIN_MAX_RETRIES
+      || input.maxRetries > MAX_MAX_RETRIES
+    )
   ) {
     return {
       ok: false,
@@ -391,68 +398,81 @@ function buildRunRequest(input: BuildRunRequestInput): BuildRunRequestResult {
   const estimateRequest = estimateResult.request
   const request: RunScenarioRequest = {
     scenario_name: input.scenario.scenario_name,
-    target_name: input.targetName,
-    techniques: estimateRequest.techniques,
-    max_concurrency: input.maxConcurrency,
-    max_retries: input.maxRetries,
-    include_baseline: estimateRequest.include_baseline,
-    labels: input.labels,
+    ...estimateRequest,
   }
-  if (estimateRequest.dataset_names !== undefined) {
-    request.dataset_names = estimateRequest.dataset_names
+  if (input.operationId) request.operation_id = input.operationId
+  if (supportsParameter(input.scenario, 'max_concurrency')) {
+    request.max_concurrency = input.maxConcurrency
   }
-  if (estimateRequest.max_dataset_size !== undefined) {
-    request.max_dataset_size = estimateRequest.max_dataset_size
+  if (supportsParameter(input.scenario, 'max_retries')) {
+    request.max_retries = input.maxRetries
   }
-  if (estimateRequest.dataset_filters !== undefined) {
-    request.dataset_filters = estimateRequest.dataset_filters
-  }
-  if (estimateRequest.scenario_params !== undefined) {
-    request.scenario_params = estimateRequest.scenario_params
+  if (supportsParameter(input.scenario, 'memory_labels')) {
+    request.labels = input.labels
   }
   return { ok: true, request }
 }
 
 interface ScenarioDetailProps {
-  activeTarget: TargetInstance | null
+  targets: TargetInstance[]
+  defaultObjectiveTarget: TargetInstance | null
+  defaultAdversarialTarget: TargetInstance | null
   labels: Record<string, string>
+  /** The saved Operation that new runs join, or null for none. */
+  operationId?: string | null
+  /** False while the current generation's server defaults are still loading. */
+  defaultsReady?: boolean
   onNavigate: (view: ViewName) => void
 }
 
 export default function ScenarioDetail(props: ScenarioDetailProps) {
   const { scenarioName: encodedScenarioName } = useParams<{ scenarioName: string }>()
-  // Keying on the raw URL param forces a full remount (and state reset to the
-  // initial "loading" values) whenever the route navigates from one scenario
-  // detail page directly to another.
-  return <ScenarioDetailContent key={encodedScenarioName} encodedScenarioName={encodedScenarioName} {...props} />
+  const [searchParams] = useSearchParams()
+  const conversationIds = searchParams.getAll('prepended_conversation_id')
+  const initialConversationId = conversationIds.length === 1 ? conversationIds[0].trim() : ''
+  // A new scenario or conversation link starts a fresh configuration form.
+  return <ScenarioDetailContent key={`${encodedScenarioName}:${initialConversationId}`}
+    encodedScenarioName={encodedScenarioName} initialConversationId={initialConversationId} {...props} />
 }
 
 interface ScenarioDetailContentProps extends ScenarioDetailProps {
   encodedScenarioName: string | undefined
+  initialConversationId: string
 }
 
 function ScenarioDetailContent({
   encodedScenarioName,
-  activeTarget,
+  initialConversationId,
+  targets,
+  defaultObjectiveTarget,
+  defaultAdversarialTarget,
+  defaultsReady = false,
   labels,
+  operationId = null,
   onNavigate,
 }: ScenarioDetailContentProps) {
   const styles = useScenarioDetailStyles()
   const decodedScenarioName = routerPathParamValue(encodedScenarioName)
 
   const [scenario, setScenario] = useState<RegisteredScenario | null>(null)
+  const { generation, ready } = useRuntime()
   const [scenarioStatus, setScenarioStatus] = useState<LoadStatus>('loading')
   const [scenarioError, setScenarioError] = useState<string | null>(null)
-  const [targets, setTargets] = useState<TargetInstance[] | null>(null)
-  const [targetsError, setTargetsError] = useState<string | null>(null)
   const [refetchCount, setRefetchCount] = useState(0)
 
   useEffect(() => {
+    if (!ready) return
     let cancelled = false
     scenariosApi
       .getScenario(decodedScenarioName)
       .then((data) => {
         if (cancelled) return
+        if (!Array.isArray(data.supported_parameter_names)) {
+          setScenario(null)
+          setScenarioStatus('error')
+          setScenarioError('The scenario catalog has no input support metadata. Update the backend and reload.')
+          return
+        }
         setScenario(data)
         setScenarioStatus('success')
         setScenarioError(null)
@@ -467,39 +487,15 @@ function ScenarioDetailContent({
     return () => {
       cancelled = true
     }
-  }, [decodedScenarioName, refetchCount])
-
-  useEffect(() => {
-    let cancelled = false
-    fetchAllPages(
-      (cursor) => targetsApi.listTargets(TARGET_PAGE_SIZE, cursor),
-      undefined,
-      (target) => target.target_registry_name,
-    )
-      .then((items) => {
-        if (cancelled) return
-        setTargets(items)
-        setTargetsError(null)
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return
-        setTargets([])
-        setTargetsError(toApiError(err).detail)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [refetchCount])
+  }, [decodedScenarioName, refetchCount, generation, ready])
 
   const handleRetry = (): void => {
     setScenarioStatus('loading')
     setScenarioError(null)
-    setTargets(null)
-    setTargetsError(null)
     setRefetchCount((count) => count + 1)
   }
 
-  if (scenarioStatus === 'loading' || targets === null) {
+  if (scenarioStatus === 'loading') {
     return (
       <section className={styles.root} data-testid="scenario-detail" aria-label="Scenario detail">
         <div className={styles.centeredState}>
@@ -525,7 +521,7 @@ function ScenarioDetailContent({
     )
   }
 
-  if (scenarioStatus === 'error' || targetsError) {
+  if (scenarioStatus === 'error') {
     return (
       <section className={styles.root} data-testid="scenario-detail" aria-label="Scenario detail">
         <div className={styles.content}>
@@ -534,7 +530,7 @@ function ScenarioDetailContent({
           </Link>
           <div className={styles.centeredState} data-testid="scenario-error">
             <MessageBar intent="error">
-              <MessageBarBody>{scenarioError ?? targetsError}</MessageBarBody>
+              <MessageBarBody>{scenarioError}</MessageBarBody>
             </MessageBar>
             <Button
               className={styles.touchTarget}
@@ -560,9 +556,13 @@ function ScenarioDetailContent({
     <ScenarioLaunchForm
       key={scenario.scenario_name}
       scenario={scenario}
+      initialConversationId={initialConversationId}
       targets={targets}
-      activeTarget={activeTarget}
+      defaultObjectiveTarget={defaultObjectiveTarget}
+      defaultAdversarialTarget={defaultAdversarialTarget}
       labels={labels}
+      operationId={operationId}
+      defaultsReady={defaultsReady}
       onNavigate={onNavigate}
     />
   )
@@ -570,19 +570,31 @@ function ScenarioDetailContent({
 
 interface ScenarioLaunchFormProps {
   scenario: RegisteredScenario
+  initialConversationId: string
   targets: TargetInstance[]
-  activeTarget: TargetInstance | null
+  defaultObjectiveTarget: TargetInstance | null
+  defaultAdversarialTarget: TargetInstance | null
   labels: Record<string, string>
+  operationId: string | null
+  /** False while the current generation's server defaults are still loading. */
+  defaultsReady?: boolean
   onNavigate: (view: ViewName) => void
 }
 
 function ScenarioLaunchForm({
   scenario,
+  initialConversationId,
   targets,
-  activeTarget,
+  defaultObjectiveTarget,
+  defaultAdversarialTarget,
   labels,
+  operationId,
+  defaultsReady = false,
   onNavigate,
 }: ScenarioLaunchFormProps) {
+  const runtime = useRuntime()
+  const [selectionGeneration, setSelectionGeneration] = useState(runtime.generation)
+  const staleSelection = selectionGeneration !== runtime.generation
   const styles = useScenarioDetailStyles()
   const navigate = useNavigate()
   const formId = `scenario-launch-${encodeURIComponent(scenario.scenario_name).replace(/%/g, '-')}`
@@ -593,40 +605,141 @@ function ScenarioLaunchForm({
   )
   const dynamicParameters = useMemo(
     () => scenario.supported_parameters.filter(
-      (parameter) => !COMMON_SCENARIO_PARAMETER_NAMES.has(parameter.name),
+      (parameter) => supportsParameter(scenario, parameter.name)
+        && !COMMON_SCENARIO_PARAMETER_NAMES.has(parameter.name),
     ),
-    [scenario.supported_parameters],
+    [scenario],
   )
+  const conversationConvertersParameter = dynamicParameters.some((parameter) => parameter.name === 'prepended_conversation_id')
+    ? dynamicParameters.find((parameter) => parameter.name === 'apply_converters_to_prepended_history')
+    : undefined
+  const supportsObjectiveTarget = supportsParameter(scenario, 'objective_target')
+  const supportsTechniques = supportsParameter(scenario, 'scenario_techniques')
+  const supportsBaseline = supportsParameter(scenario, 'include_baseline')
+  const supportsDatasets = supportsParameter(scenario, 'dataset_config')
+  const supportsConcurrency = supportsParameter(scenario, 'max_concurrency')
+  const supportsRetries = supportsParameter(scenario, 'max_retries')
   const isBaselineForbidden = scenario.baseline_policy === 'forbidden'
+  const singleTechnique = scenario.max_concrete_techniques === 1
 
   const [targetName, setTargetName] = useState(() => {
-    if (activeTarget && targets.some((target) =>
-      target.target_registry_name === activeTarget.target_registry_name)) {
-      return activeTarget.target_registry_name
+    if (defaultObjectiveTarget && targets.some((target: TargetInstance) =>
+      sameTarget(target, defaultObjectiveTarget))) {
+      return defaultObjectiveTarget.target_registry_name
     }
-    return targets[0]?.target_registry_name ?? ''
+    return ''
+  })
+  const adversarialTargets = targets.filter(
+    (target: TargetInstance) => target.capabilities?.supports_multi_turn === true,
+  )
+  const [adversarialTargetName, setAdversarialTargetName] = useState(() => {
+    if (defaultAdversarialTarget && adversarialTargets.some((target: TargetInstance) =>
+      sameTarget(target, defaultAdversarialTarget))) {
+      return defaultAdversarialTarget.target_registry_name
+    }
+    return ''
   })
   const [selectedTechniques, setSelectedTechniques] = useState<string[]>(() => defaultTechniques)
+  const techniqueEditor = useRunTechniqueEditor(
+    singleTechnique && supportsTechniques && selectedTechniques.length === 1 ? selectedTechniques[0] : undefined,
+    runtime.generation, runtime.ready,
+  )
+  const [pendingTechnique, setPendingTechnique] = useState<string | null>(null)
+  const techniqueEditError = techniqueEditor.unresolved
+    ? techniqueEditor.error ?? 'Loading selected technique settings.'
+    : techniqueEditor.pending ? 'Wait for valid technique settings before launch.' : undefined
+  const supportsPrependedConversation = !singleTechnique
+    || techniqueEditor.configuration?.supports_prepended_conversation === true
+  const objectiveParameters = dynamicParameters.filter((parameter) => OBJECTIVE_PARAMETER_NAMES.has(parameter.name))
+  const historyParameters = dynamicParameters.filter((parameter) => CONVERSATION_PARAMETER_NAMES.has(parameter.name)
+    && parameter.name !== conversationConvertersParameter?.name)
+  const generalParameters = dynamicParameters.filter((parameter) =>
+    !OBJECTIVE_PARAMETER_NAMES.has(parameter.name) && !CONVERSATION_PARAMETER_NAMES.has(parameter.name))
+  const unavailableSelection = (
+    supportsObjectiveTarget && targetName !== ''
+    && !targets.some((target) => target.target_registry_name === targetName)
+  ) || (supportsTechniques
+    && selectedTechniques.some((name) => !techniqueOptions.some((technique) => technique.name === name)))
   const [baselineChecked, setBaselineChecked] = useState(
     () => !isBaselineForbidden && scenario.include_baseline_by_default,
   )
-  const [datasetOverride, setDatasetOverride] = useState('')
-  const configuredDefaultMaxDatasetSize = useMemo(
-    () => defaultMaxDatasetSize(scenario),
-    [scenario],
-  )
-  const [maxDatasetSize, setMaxDatasetSize] = useState(configuredDefaultMaxDatasetSize)
-  const [harmCategoriesFilter, setHarmCategoriesFilter] = useState('')
-  const [dataTypesFilter, setDataTypesFilter] = useState('')
+  const [datasetEdits, setDatasetEdits] = useState<ScenarioDatasetRequest>({})
+  const [datasetError, setDatasetError] = useState<string | null>(null)
+  const datasetMetadata = useScenarioDatasets()
+  const [datasetProjection, setDatasetProjection] = useState<ScenarioRunSizeEstimateResponse | null>(null)
+  const datasetDefaults: ScenarioDatasetSettings = datasetProjection?.dataset_defaults
+    ?? scenarioDatasetDefaults(scenario)
+  const effectiveDatasets = datasetProjection?.effective_datasets ?? datasetDefaults
+  const datasetOptions: ScenarioDatasetOptions = datasetProjection?.dataset_options
+    ?? scenarioDatasetOptions(scenario)
+  const selectedDatasetNames = (datasetEdits.sources ?? datasetDefaults.sources).map((source) => source.name)
+  const datasetSelectionKey = JSON.stringify(selectedDatasetNames)
+  const reloadDatasetMetadata = datasetMetadata.reload
+  const previousDatasetSelection = useRef(datasetSelectionKey)
+  useEffect(() => {
+    if (previousDatasetSelection.current !== datasetSelectionKey) {
+      previousDatasetSelection.current = datasetSelectionKey
+      reloadDatasetMetadata()
+    }
+  }, [datasetSelectionKey, reloadDatasetMetadata])
   const [maxConcurrency, setMaxConcurrency] = useState(DEFAULT_MAX_CONCURRENCY)
   const [maxRetries, setMaxRetries] = useState(DEFAULT_MAX_RETRIES)
   const [scenarioParamValues, setScenarioParamValues] = useState<Record<string, ParameterFormValue>>(() =>
-    getInitialFormValues(dynamicParameters),
+    getInitialFormValues(dynamicParameters, initialConversationId ? { prepended_conversation_id: initialConversationId } : undefined),
   )
   const [validationError, setValidationError] = useState<string | null>(null)
   const [apiError, setApiError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [previewOpen, setPreviewOpen] = useState(false)
+  const newAttackContext = useMemo(() => ({
+    generation: runtime.generation,
+    ready: runtime.ready && defaultsReady && !staleSelection,
+    labels,
+  }), [runtime.generation, runtime.ready, defaultsReady, staleSelection, labels])
+  const conversation = useConversationDraft(newAttackContext)
+  const conversationEditorRef = useRef<ConversationEditorHandle>(null)
+  const conversationContextRef = useRef(newAttackContext)
+  useLayoutEffect(() => { conversationContextRef.current = newAttackContext }, [newAttackContext])
+  const conversationLoadSequence = useRef(0)
+  useEffect(() => () => { conversationLoadSequence.current += 1 }, [])
+  const [conversationParameter, setConversationParameter] = useState('')
+  const [loadingConversation, setLoadingConversation] = useState(false)
+  const [conversationError, setConversationError] = useState<string | null>(null)
+  const conversationBusy = loadingConversation || conversation.draft !== null
+  const configuredConversationId = scenarioParamValues.prepended_conversation_id
+  const canEditConversation = typeof configuredConversationId === 'string' && Boolean(configuredConversationId.trim())
+
+  const beginConversation = async (parameterName: string, edit: boolean): Promise<void> => {
+    if (conversationBusy || previewOpen || isSubmittingRef.current) return
+    const sequence = ++conversationLoadSequence.current
+    const initialContext = conversationContextRef.current
+    setConversationParameter(parameterName)
+    setConversationError(null)
+    setLoadingConversation(edit)
+    try {
+      const value = scenarioParamValues[parameterName]
+      if (edit && (typeof value !== 'string' || !value.trim())) {
+        throw new Error('Enter a saved conversation ID before editing.')
+      }
+      const source = edit && typeof value === 'string' ? await attacksApi.getConversation(value.trim()) : null
+      if (sequence !== conversationLoadSequence.current) return
+      const currentContext = conversationContextRef.current
+      if (!currentContext.ready || currentContext.generation !== initialContext.generation) {
+        throw new Error('Runtime or default labels changed. Retry after default labels finish loading.')
+      }
+      conversation.begin({
+        messages: source ? toConversationDraft(source.messages.messages) : [newDraftMessage()],
+        objective: '', initialObjective: '',
+        sourceAttackId: source?.attack.attack_result_id ?? null,
+        sourceConversationId: source?.messages.conversation_id ?? null,
+        target: null, labels: currentContext.labels,
+      })
+    } catch (error) {
+      if (sequence === conversationLoadSequence.current) setConversationError(toApiError(error).detail)
+    } finally {
+      if (sequence === conversationLoadSequence.current) setLoadingConversation(false)
+    }
+  }
   const [estimateRequestState, setEstimateRequestState] = useState<EstimateRequestState | null>(null)
   const [lastGoodEstimate, setLastGoodEstimate] = useState<SuccessfulEstimateResult | null>(null)
   // Synchronous guard against a double-submit racing ahead of the state update.
@@ -654,82 +767,90 @@ function ScenarioLaunchForm({
 
   const selectableTechniques = useMemo<SelectableTechnique[]>(
     () => [
-      {
+      ...(supportsBaseline ? [{
         ...BASELINE_TECHNIQUE,
         isBaseline: true,
         disabled: isBaselineForbidden,
-      },
-      ...techniqueOptions.map((technique) => ({
+      }] : []),
+      ...(supportsTechniques ? techniqueOptions.map((technique) => ({
         ...technique,
         isBaseline: false,
         disabled: false,
-      })),
+      })) : []),
     ],
-    [isBaselineForbidden, techniqueOptions],
+    [isBaselineForbidden, supportsBaseline, supportsTechniques, techniqueOptions],
   )
   const techniques = selectedTechniques
-  const maxDatasetSizeOverride = maxDatasetSize.trim()
-    && maxDatasetSize !== configuredDefaultMaxDatasetSize
-    ? maxDatasetSize
-    : ''
+  const datasetSizeLabel = !datasetOptions.total_limit ? 'Not applicable'
+    : effectiveDatasets.max_total === 'all' ? 'No total limit' : String(effectiveDatasets.max_total)
   const estimateResult = useMemo(
     () => buildEstimateRequest({
       scenario,
       targetName,
+      adversarialTargetName,
       techniques,
+      techniqueOverride: techniqueEditor.override,
+      techniqueEditError,
+      supportsPrependedConversation,
       dynamicParameters,
       scenarioParamValues,
-      datasetOverride,
-      maxDatasetSize: maxDatasetSizeOverride,
-      harmCategoriesFilter,
-      dataTypesFilter,
+      datasetEdits,
+      datasetError,
       includeBaseline: isBaselineForbidden ? false : baselineChecked,
     }),
     [
+      adversarialTargetName,
       baselineChecked,
-      datasetOverride,
-      dataTypesFilter,
+      datasetEdits,
+      datasetError,
       dynamicParameters,
-      harmCategoriesFilter,
       isBaselineForbidden,
-      maxDatasetSizeOverride,
       scenario,
       scenarioParamValues,
       targetName,
       techniques,
+      techniqueEditor.override,
+      techniqueEditError,
+      supportsPrependedConversation,
     ],
   )
   const requestResult = useMemo(
     () => buildRunRequest({
       scenario,
       targetName,
+      adversarialTargetName,
       techniques,
+      techniqueOverride: techniqueEditor.override,
+      techniqueEditError,
+      supportsPrependedConversation,
       dynamicParameters,
       scenarioParamValues,
-      datasetOverride,
-      maxDatasetSize: maxDatasetSizeOverride,
-      harmCategoriesFilter,
-      dataTypesFilter,
+      datasetEdits,
+      datasetError,
       maxConcurrency,
       maxRetries,
       includeBaseline: isBaselineForbidden ? false : baselineChecked,
       labels,
+      operationId,
     }),
     [
+      adversarialTargetName,
       baselineChecked,
-      datasetOverride,
-      dataTypesFilter,
+      datasetEdits,
+      datasetError,
       dynamicParameters,
-      harmCategoriesFilter,
       isBaselineForbidden,
       labels,
       maxConcurrency,
-      maxDatasetSizeOverride,
       maxRetries,
+      operationId,
       scenario,
       scenarioParamValues,
       targetName,
       techniques,
+      techniqueEditor.override,
+      techniqueEditError,
+      supportsPrependedConversation,
     ],
   )
   const estimateRequest = useMemo(
@@ -739,12 +860,12 @@ function ScenarioLaunchForm({
   const estimateRequestKey = useMemo(
     () => estimateRequest === null
       ? null
-      : JSON.stringify({ scenarioName: scenario.scenario_name, request: estimateRequest }),
-    [estimateRequest, scenario.scenario_name],
+      : JSON.stringify({ scenarioName: scenario.scenario_name, request: estimateRequest, generation: runtime.generation }),
+    [estimateRequest, scenario.scenario_name, runtime.generation],
   )
 
   useEffect(() => {
-    if (estimateRequest === null || estimateRequestKey === null) {
+    if (!runtime.ready || staleSelection || estimateRequest === null || estimateRequestKey === null) {
       return
     }
 
@@ -763,10 +884,12 @@ function ScenarioLaunchForm({
             return
           }
           const result = mapScenarioRunEstimate(response, 'request')
+          setDatasetProjection(response)
           setEstimateRequestState({
             status: 'resolved',
             requestKey: estimateRequestKey,
             result,
+            datasetSettings: response.effective_datasets,
           })
           if (result.status === 'available' || result.status === 'conditional') {
             setLastGoodEstimate(result)
@@ -779,11 +902,26 @@ function ScenarioLaunchForm({
           ) {
             return
           }
+          const error = toApiError(err)
           setEstimateRequestState({
             status: 'error',
             requestKey: estimateRequestKey,
-            error: toApiError(err).detail,
+            error: error.detail,
           })
+          if (estimateRequest.datasets && (error.status === 400 || error.status === 422)) {
+            const { datasets, ...defaultRequest } = estimateRequest
+            void datasets
+            // Keep invalid edits visible while refreshing parameter-aware allowed sources.
+            void scenariosApi.estimateRun(scenario.scenario_name, defaultRequest, controller.signal)
+              .then((response) => {
+                if (controller.signal.aborted || requestSequence !== estimateSequenceRef.current) return
+                setDatasetProjection((previous) => ({
+                  ...response,
+                  effective_datasets: previous?.effective_datasets ?? response.effective_datasets,
+                }))
+              })
+              .catch(() => { /* The original validation error remains authoritative. */ })
+          }
         })
     }, ESTIMATE_DEBOUNCE_MS)
 
@@ -791,7 +929,7 @@ function ScenarioLaunchForm({
       window.clearTimeout(debounceTimer)
       controller.abort()
     }
-  }, [estimateRequest, estimateRequestKey, scenario.scenario_name])
+  }, [estimateRequest, estimateRequestKey, scenario.scenario_name, runtime.ready, staleSelection])
 
   let estimateState: ScenarioRunEstimateState
   if (!estimateResult.ok) {
@@ -837,8 +975,17 @@ function ScenarioLaunchForm({
     if (technique.isBaseline) {
       setBaselineChecked(checked)
     } else {
+      if (singleTechnique && checked && technique.name !== selectedTechniques[0] && techniqueEditor.hasChanges) {
+        setPendingTechnique(technique.name)
+        return
+      }
+      if (singleTechnique && technique.name !== selectedTechniques[0]) techniqueEditor.discard()
       setSelectedTechniques((current) => {
         if (checked) {
+          if (singleTechnique) return [technique.name]
+          if (scenario.max_concrete_techniques != null && current.length >= scenario.max_concrete_techniques) {
+            return current
+          }
           return current.includes(technique.name)
             ? current
             : [...current, technique.name]
@@ -861,6 +1008,10 @@ function ScenarioLaunchForm({
     const memberNames = new Set(
       members.filter((technique) => !technique.isBaseline).map((technique) => technique.name),
     )
+    if (shouldSelect && scenario.max_concrete_techniques != null
+      && new Set([...selectedTechniques, ...memberNames]).size > scenario.max_concrete_techniques) {
+      return
+    }
     setSelectedTechniques((current) => {
       const selected = new Set(current)
       for (const name of memberNames) {
@@ -880,7 +1031,8 @@ function ScenarioLaunchForm({
   }
 
   const handleLaunchConfirmed = async (): Promise<void> => {
-    if (isSubmittingRef.current) {
+    if (isSubmittingRef.current || conversationBusy || techniqueEditError || !runtime.ready || !defaultsReady || staleSelection || unavailableSelection
+      || checkingRefreshPolicies) {
       return
     }
 
@@ -897,12 +1049,15 @@ function ScenarioLaunchForm({
 
     try {
       const summary = await scenariosApi.startRun(requestResult.request)
+      datasetMetadata.reload()
       setPreviewOpen(false)
       navigate(scenarioRunRoutePath(summary.scenario_result_id), {
         state: { scenarioName: scenario.scenario_name },
       })
     } catch (err) {
       setApiError(toApiError(err).detail)
+      setPreviewOpen(false)
+      restoreLaunchFocus()
     } finally {
       isSubmittingRef.current = false
       setSubmitting(false)
@@ -911,6 +1066,7 @@ function ScenarioLaunchForm({
 
   const handleFormSubmit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
+    if (conversationBusy || techniqueEditError || isSubmittingRef.current) return
     setApiError(null)
     if (!requestResult.ok) {
       setValidationError(requestResult.error)
@@ -920,14 +1076,76 @@ function ScenarioLaunchForm({
     setPreviewOpen(true)
   }
 
-  const techniqueSelectionInvalid = selectedTechniques.length === 0
+  const techniqueSelectionOverLimit = supportsTechniques && scenario.max_concrete_techniques != null
+    && selectedTechniques.length > scenario.max_concrete_techniques
+  const techniqueSelectionError = supportsTechniques && selectedTechniques.length === 0
+    ? 'Select at least one attack technique.'
+    : techniqueSelectionOverLimit
+    ? `Select at most ${scenario.max_concrete_techniques} concrete technique(s).`
+    : null
   const displayedEstimateNotes = estimateNotes(estimateState)
   const displayedEstimate = estimateFromState(estimateState)
-  const selectedTechniqueCount = selectedTechniques.length + (baselineChecked ? 1 : 0)
-  const previewDatasets = parseDatasetNames(datasetOverride)
-  const effectiveDatasets = previewDatasets.length > 0 ? previewDatasets : scenario.default_datasets
-  const previewHarmCategories = parseDatasetNames(harmCategoriesFilter)
-  const previewDataTypes = parseDatasetNames(dataTypesFilter)
+  const selectedTechniqueCount = (supportsTechniques ? selectedTechniques.length : 0)
+    + (supportsBaseline && baselineChecked && !isBaselineForbidden ? 1 : 0)
+  const previewDatasets = (datasetEdits.sources ?? datasetDefaults.sources).map((source) => source.name)
+  const previewDatasetNames = previewDatasets.length > 0 ? previewDatasets : scenario.default_datasets
+  const previewFilters = { ...datasetDefaults.filters, ...datasetEdits.filters }
+  const previewHarmCategories = previewFilters.harm_categories ?? []
+  const previewDataTypes = previewFilters.data_types ?? []
+  const currentDatasetEstimate = estimateRequestState?.requestKey === estimateRequestKey ? estimateRequestState : null
+  const confirmedDatasetSettings = currentDatasetEstimate?.status === 'resolved'
+    ? currentDatasetEstimate.datasetSettings : undefined
+  const checkingRefreshPolicies = supportsDatasets && selectedDatasetNames.length > 0 && currentDatasetEstimate === null
+  const unconfirmedRefreshPolicies = supportsDatasets && selectedDatasetNames.length > 0
+    && !checkingRefreshPolicies && confirmedDatasetSettings === undefined
+  const refreshDatasets = [...new Set((confirmedDatasetSettings?.sources ?? [])
+    .filter((source) => source.fetch === 'always').map((source) => source.name))]
+  const editedRefreshDatasets = refreshDatasets.filter((name) => {
+    const metadata = datasetMetadata.items.find((item) => item.name === name)
+    return metadata?.loaded && (!metadata.origins?.length
+      || metadata.origins.some((origin) => origin === 'user' || origin === 'unknown'))
+  })
+  const uncheckedRefreshDatasets = refreshDatasets.filter((name) => datasetMetadata.loading || datasetMetadata.error
+    || !datasetMetadata.items.some((item) => item.name === name))
+
+  const renderScenarioParameter = (parameter: Parameter): React.ReactElement => (
+    <div key={parameter.name} className={styles.dynamicParameters}>
+      <ParameterField
+        parameter={parameter}
+        value={scenarioParamValues[parameter.name]}
+        disabled={submitting || loadingConversation}
+        onChange={updateScenarioParam}
+        testIdPrefix="scenario-param"
+      />
+      {parameter.name === 'prepended_conversation_id' && <>
+        <div className={styles.conversationActions}>
+          <Button type="button" className={styles.touchTarget}
+            disabled={submitting || conversationBusy || previewOpen || !newAttackContext.ready}
+            onClick={() => { void beginConversation(parameter.name, false) }}>
+            Add new conversation
+          </Button>
+          <Button type="button" className={styles.touchTarget}
+            disabled={submitting || conversationBusy || previewOpen || !newAttackContext.ready || !canEditConversation}
+            onClick={() => { void beginConversation(parameter.name, true) }}>
+            Edit conversation
+          </Button>
+          {conversationConvertersParameter && (
+            <Tooltip relationship="description"
+              content="Apply request converters to stored history when the scan runs. The source conversation does not change. New outgoing turns are always converted.">
+              <Switch label="Apply converters to conversation" className={styles.selectionControl}
+                checked={scenarioParamValues[conversationConvertersParameter.name] === 'true'}
+                disabled={submitting || loadingConversation || !newAttackContext.ready || !canEditConversation}
+                onChange={(_, data) => updateScenarioParam(conversationConvertersParameter.name, String(data.checked))} />
+            </Tooltip>
+          )}
+        </div>
+        {loadingConversation && <Spinner size="tiny" label="Loading conversation..." />}
+        {conversationError && <MessageBar intent="error">
+          <MessageBarBody>{conversationError}</MessageBarBody>
+        </MessageBar>}
+      </>}
+    </div>
+  )
 
   return (
     <section
@@ -954,9 +1172,24 @@ function ScenarioLaunchForm({
             onSubmit={handleFormSubmit}
             noValidate
           >
-            {validationError && (
+            {validationError && !requestResult.ok && (
               <MessageBar intent="warning">
-                <MessageBarBody role="alert">{validationError}</MessageBarBody>
+                <MessageBarBody role="alert">{requestResult.error}</MessageBarBody>
+              </MessageBar>
+            )}
+            {(staleSelection || (targetName && unavailableSelection)) && (
+              <MessageBar intent="warning">
+                <MessageBarBody>
+                  PyRIT was reinitialized. Review the refreshed target and technique selections before starting.
+                  Your parameter drafts have been preserved.
+                  <Button onClick={() => {
+                    setSelectedTechniques(selectedTechniques.filter((name) =>
+                      techniqueOptions.some((technique) => technique.name === name)))
+                    setSelectionGeneration(runtime.generation)
+                  }}>
+                    I have reviewed the refreshed selections
+                  </Button>
+                </MessageBarBody>
               </MessageBar>
             )}
             {apiError && (
@@ -975,48 +1208,19 @@ function ScenarioLaunchForm({
               />
             </section>
 
-            <section className={styles.section} aria-labelledby="target-section-title">
-              <Text id="target-section-title" as="h2" size={400} weight="semibold">Target</Text>
-              <Field hint="The registered target this scenario will run against.">
-                <Select
-                  className={styles.control}
-                  value={targetName}
-                  disabled={submitting}
-                  onChange={(_, data) => setTargetName(data.value)}
-                  data-testid="scenario-target-select"
-                  aria-label="Target"
-                >
-                  {targets.length === 0 && <option value="">No targets configured</option>}
-                  {targets.map((target) => (
-                    <option key={target.target_registry_name} value={target.target_registry_name}>
-                      {targetOptionLabel(target)}
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-              {targets.length === 0 && (
-                <Button
-                  className={styles.touchTarget}
-                  appearance="secondary"
-                  icon={<SettingsRegular />}
-                  type="button"
-                  onClick={() => onNavigate('registry')}
-                >
-                  Configure target to launch
-                </Button>
-              )}
-            </section>
-
+            {(supportsTechniques || supportsBaseline) && (
             <section className={styles.section} aria-labelledby="techniques-section-title">
               <Text id="techniques-section-title" as="h2" size={400} weight="semibold">
                 Techniques
               </Text>
-              <Text size={200} className={styles.hint}>
-                Select individual techniques, or use a tag to select or clear all techniques with that tag.
-              </Text>
-              {techniqueSelectionInvalid && (
+              {supportsTechniques && <Text size={200} className={styles.hint}>
+                {singleTechnique
+                  ? 'Select exactly one technique. Baseline comparison is optional and separate.'
+                  : 'Select individual techniques, or use a tag to select or clear all techniques with that tag.'}
+              </Text>}
+              {techniqueSelectionError && (
                 <Text className={styles.errorText} role="alert">
-                  Select at least one attack technique.
+                  {techniqueSelectionError}
                 </Text>
               )}
               <div className={styles.techniqueList} role="group" aria-label="Techniques">
@@ -1024,14 +1228,27 @@ function ScenarioLaunchForm({
                   const selected = isTechniqueSelected(technique)
                   return (
                     <div className={styles.techniqueOption} key={technique.name}>
-                    <Checkbox
+                    {singleTechnique && !technique.isBaseline ? (
+                      <Radio
+                        className={styles.selectionControl}
+                        name={`${formId}-technique`}
+                        label={technique.name}
+                        value={technique.name}
+                        checked={selected && !techniqueSelectionOverLimit}
+                        disabled={submitting || technique.disabled}
+                        onChange={() => handleTechniqueChange(technique, true)}
+                        data-testid={`technique-${technique.name}`}
+                      />
+                    ) : <Checkbox
                       className={styles.selectionControl}
                       label={technique.name}
                       checked={selected}
-                      disabled={submitting || technique.disabled}
+                      disabled={submitting || technique.disabled || (!technique.isBaseline && !selected
+                        && scenario.max_concrete_techniques != null
+                        && selectedTechniques.length >= scenario.max_concrete_techniques)}
                       onChange={(_, data) => handleTechniqueChange(technique, data.checked === true)}
                       data-testid={technique.isBaseline ? 'baseline-checkbox' : `technique-${technique.name}`}
-                    />
+                    />}
                     <div className={styles.techniqueDetails}>
                       {technique.description && (
                         <Text size={200} className={styles.hint}>{technique.description}</Text>
@@ -1043,6 +1260,14 @@ function ScenarioLaunchForm({
                               (candidate) => !candidate.disabled && candidate.tags.includes(tag),
                             )
                             const tagSelected = tagMembers.length > 0 && tagMembers.every(isTechniqueSelected)
+                            const exceedsLimit = scenario.max_concrete_techniques != null
+                              && new Set([
+                                ...selectedTechniques,
+                                ...tagMembers.filter((candidate) => !candidate.isBaseline).map((candidate) => candidate.name),
+                              ]).size > scenario.max_concrete_techniques
+                            if (singleTechnique) {
+                              return <Badge key={tag} size="small" appearance="outline">{techniqueSetName(tag)}</Badge>
+                            }
                             return (
                               <ToggleButton
                                 className={styles.techniqueTag}
@@ -1050,7 +1275,7 @@ function ScenarioLaunchForm({
                                 size="small"
                                 appearance="outline"
                                 checked={tagSelected}
-                                disabled={submitting || tagMembers.length === 0}
+                                disabled={submitting || tagMembers.length === 0 || (!tagSelected && exceedsLimit)}
                                 onClick={() => handleTagChange(tag)}
                                 aria-label={`${tagSelected ? 'Clear' : 'Select'} ${techniqueSetName(tag)} techniques`}
                               >
@@ -1071,78 +1296,119 @@ function ScenarioLaunchForm({
                 })}
               </div>
             </section>
+            )}
 
+            {(supportsObjectiveTarget || objectiveParameters.length > 0) && (
+              <section className={styles.section} aria-labelledby="objective-section-title">
+                <Text id="objective-section-title" as="h2" size={400} weight="semibold">Objective</Text>
+                {supportsObjectiveTarget && <>
+                  <Field label="Objective Target" required hint="The registered target this scenario will run against.">
+                    <Select
+                      className={styles.control}
+                      value={targetName}
+                      disabled={submitting}
+                      onChange={(_, data) => { setTargetName(data.value); setSelectionGeneration(runtime.generation) }}
+                      data-testid="scenario-target-select"
+                    >
+                      {!targets.some((target) => target.target_registry_name === targetName) && (
+                        <option value={targetName} disabled>
+                          {targets.length === 0 ? 'No targets configured' : 'Select an available target'}
+                        </option>
+                      )}
+                      {targets.map((target) => (
+                        <option key={target.target_registry_name} value={target.target_registry_name}>
+                          {targetOptionLabel(target)}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  {targets.length === 0 && (
+                    <Button className={styles.touchTarget} appearance="secondary" icon={<SettingsRegular />}
+                      type="button" onClick={() => onNavigate('registry')}>
+                      Configure target to launch
+                    </Button>
+                  )}
+                </>}
+                {objectiveParameters.map(renderScenarioParameter)}
+              </section>
+            )}
+
+            {((singleTechnique && supportsTechniques) || historyParameters.length > 0) && (
+              <section className={styles.section} aria-labelledby="technique-parameters-section-title">
+                <Text id="technique-parameters-section-title" as="h2" size={400} weight="semibold">
+                  Technique Parameters
+                </Text>
+                {singleTechnique && supportsTechniques && <>
+                  {techniqueEditor.unresolved && !techniqueEditor.error && <Spinner size="tiny" label="Loading technique settings..." />}
+                  {techniqueEditor.error && <MessageBar intent="error"><MessageBarBody>
+                    {techniqueEditor.error}
+                    <Button className={styles.touchTarget} type="button" onClick={techniqueEditor.retry}>Retry technique settings</Button>
+                  </MessageBarBody></MessageBar>}
+                  {techniqueEditor.hasChanges && <div className={styles.previewBadges}>
+                    {techniqueEditor.edited && <Badge appearance="outline">Edited for this run</Badge>}
+                    <Button className={styles.touchTarget} type="button" disabled={submitting || previewOpen}
+                      onClick={techniqueEditor.reset}>Reset to original</Button>
+                  </div>}
+                  {techniqueEditor.original && <TechniqueEditor key={techniqueEditor.formKey}
+                    original={techniqueEditor.original} initial={techniqueEditor.configuration}
+                    autoApply onPending={techniqueEditor.markPending} onApplied={techniqueEditor.apply}
+                    disabled={!runtime.ready || staleSelection || submitting || previewOpen || conversationBusy} />}
+                </>}
+                {supportsPrependedConversation ? historyParameters.map(renderScenarioParameter)
+                  : historyParameters.length > 0 && <>
+                    <Text>This technique does not accept a prepended conversation.</Text>
+                    {canEditConversation && <MessageBar intent="warning"><MessageBarBody>
+                      Clear the saved conversation before launch. It is not compatible with this technique.
+                      <Button className={styles.touchTarget} type="button" disabled={submitting}
+                        onClick={() => setScenarioParamValues((current) => ({
+                          ...current, prepended_conversation_id: '', apply_converters_to_prepended_history: 'false',
+                        }))}>Clear saved conversation</Button>
+                    </MessageBarBody></MessageBar>}
+                  </>}
+              </section>
+            )}
+
+            {(supportsDatasets || datasetDefaults.sources.length > 0) && (
+            <section className={styles.section} aria-labelledby="datasets-section-title">
+              <Text id="datasets-section-title" as="h2" size={400} weight="semibold">Datasets</Text>
+              <ScenarioDatasetTable
+                request={datasetEdits} defaults={datasetDefaults} effective={effectiveDatasets}
+                options={supportsDatasets ? datasetOptions : { ...datasetOptions, mode: 'fixed', supports_overrides: false }}
+                datasets={datasetMetadata.items} disabled={submitting}
+                loading={datasetMetadata.loading} metadataError={datasetMetadata.error}
+                preparing={datasetMetadata.preparing} loadError={datasetMetadata.loadError}
+                loadEnabled={runtime.ready && !staleSelection && estimateRequest !== null
+                  && confirmedDatasetSettings !== undefined
+                  && !confirmedDatasetSettings.sources.some((source) => source.fetch === 'always'
+                    && !datasetMetadata.items.some((item) => item.name === source.name && item.loaded))}
+                onLoad={() => { if (estimateRequest) void datasetMetadata.loadSelected(scenario.scenario_name, estimateRequest) }}
+                onReload={datasetMetadata.reload} onChange={setDatasetEdits} onValidationChange={setDatasetError}
+              />
+            </section>
+            )}
+
+            {(generalParameters.length > 0 || scenario.uses_default_adversarial_target
+              || supportsConcurrency || supportsRetries) && (
             <section className={styles.section} aria-labelledby="parameters-section-title">
               <Text id="parameters-section-title" as="h2" size={400} weight="semibold">
                 Parameters
               </Text>
               <div className={styles.dynamicParameters}>
-                {dynamicParameters.map((parameter) => (
-                  <ParameterField
-                    key={parameter.name}
-                    parameter={parameter}
-                    value={scenarioParamValues[parameter.name]}
+                {generalParameters.map(renderScenarioParameter)}
+                {scenario.uses_default_adversarial_target && (
+                  <TargetSelect
+                    targets={adversarialTargets}
+                    value={adversarialTargetName}
+                    onChange={(target: TargetInstance | null) => {
+                      setAdversarialTargetName(target?.target_registry_name ?? '')
+                    }}
+                    label="Adversarial Target"
+                    hint="The registered target this scenario uses to generate attacks."
+                    placeholder="Use server default"
                     disabled={submitting}
-                    onChange={updateScenarioParam}
-                    testIdPrefix="scenario-param"
                   />
-                ))}
-                <Field
-                  label="Dataset override"
-                  hint="Comma-separated dataset names. Leave blank to use the scenario's default datasets."
-                >
-                  <Input
-                    className={styles.control}
-                    value={datasetOverride}
-                    disabled={submitting}
-                    onChange={(_, data) => setDatasetOverride(data.value)}
-                    placeholder={scenario.default_datasets.join(', ') || undefined}
-                    data-testid="dataset-override-input"
-                  />
-                </Field>
-                <Field
-                  label="Max dataset size"
-                  hint={configuredDefaultMaxDatasetSize
-                    ? `The scenario default is ${configuredDefaultMaxDatasetSize}. Edit it to override the default.`
-                    : 'Enter a positive integer to limit the selected dataset size.'}
-                >
-                  <Input
-                    className={styles.numberInput}
-                    type="number"
-                    min={1}
-                    value={maxDatasetSize}
-                    disabled={submitting}
-                    onChange={(_, data) => setMaxDatasetSize(data.value)}
-                    data-testid="max-dataset-size-input"
-                  />
-                </Field>
-                <Field
-                  label="Harm categories"
-                  hint="Comma-separated values. A seed must match every listed category."
-                >
-                  <Input
-                    className={styles.control}
-                    value={harmCategoriesFilter}
-                    disabled={submitting}
-                    placeholder="cyber, violence"
-                    onChange={(_, data) => setHarmCategoriesFilter(data.value)}
-                    data-testid="harm-categories-filter-input"
-                  />
-                </Field>
-                <Field
-                  label="Data types"
-                  hint="Comma-separated values. A seed can match any listed data type."
-                >
-                  <Input
-                    className={styles.control}
-                    value={dataTypesFilter}
-                    disabled={submitting}
-                    placeholder="text, image_path"
-                    onChange={(_, data) => setDataTypesFilter(data.value)}
-                    data-testid="data-types-filter-input"
-                  />
-                </Field>
-                <Field label="Max concurrency">
+                )}
+                {supportsConcurrency && <Field label="Max concurrency">
                   <SingleStepSpinButton
                     className={styles.numberInput}
                     value={maxConcurrency}
@@ -1152,8 +1418,8 @@ function ScenarioLaunchForm({
                     onChange={(_, data) => setMaxConcurrency(resolveSpinButtonValue(data, maxConcurrency))}
                     data-testid="max-concurrency-input"
                   />
-                </Field>
-                <Field label="Max retries">
+                </Field>}
+                {supportsRetries && <Field label="Max retries">
                   <SingleStepSpinButton
                     className={styles.numberInput}
                     value={maxRetries}
@@ -1163,9 +1429,10 @@ function ScenarioLaunchForm({
                     onChange={(_, data) => setMaxRetries(resolveSpinButtonValue(data, maxRetries))}
                     data-testid="max-retries-input"
                   />
-                </Field>
+                </Field>}
               </div>
             </section>
+            )}
 
             <section
               className={styles.section}
@@ -1196,18 +1463,16 @@ function ScenarioLaunchForm({
                   <dt>Total atomic attacks</dt>
                   <dd>{formatAtomicAttackCount(estimateState)}</dd>
                 </div>
-                <div className={styles.costEstimateRow}>
+                {supportsDatasets && <div className={styles.costEstimateRow}>
                   <dt>Dataset size</dt>
                   <dd>
-                    {maxDatasetSizeOverride.trim()
-                      || configuredDefaultMaxDatasetSize
-                      || 'Not configured'}
+                    {datasetSizeLabel}
                   </dd>
-                </div>
-                <div className={styles.costEstimateRow}>
+                </div>}
+                {(supportsTechniques || supportsBaseline) && <div className={styles.costEstimateRow}>
                   <dt>Number techniques</dt>
                   <dd>{selectedTechniqueCount}</dd>
-                </div>
+                </div>}
                 {dynamicParameters.map((parameter) => (
                   <div className={styles.costEstimateRow} key={parameter.name}>
                     <dt>{parameter.name}</dt>
@@ -1240,13 +1505,51 @@ function ScenarioLaunchForm({
                 className={styles.launchButton}
                 appearance="primary"
                 type="submit"
-                disabled={submitting || techniqueSelectionInvalid}
+                disabled={!runtime.ready || !defaultsReady || staleSelection || unavailableSelection || submitting || conversationBusy || Boolean(techniqueEditError) || techniqueSelectionError !== null || datasetMetadata.preparing || (supportsDatasets && datasetError !== null)}
                 data-testid="launch-scenario-btn"
               >
                 Launch scan
               </Button>
             </section>
           </form>
+
+          <Dialog open={pendingTechnique !== null} onOpenChange={(_, data) => {
+            if (!data.open) setPendingTechnique(null)
+          }}>
+            <DialogSurface><DialogBody>
+              <DialogTitle>Discard technique edits?</DialogTitle>
+              <DialogContent>Switching technique removes the edits for this run. The registered technique stays unchanged.</DialogContent>
+              <DialogActions>
+                <Button className={styles.touchTarget} onClick={() => setPendingTechnique(null)}>Cancel</Button>
+                <Button className={styles.touchTarget} appearance="primary" onClick={() => {
+                  if (pendingTechnique) {
+                    techniqueEditor.discard()
+                    setSelectedTechniques([pendingTechnique])
+                  }
+                  setPendingTechnique(null)
+                }}>Discard edits and switch</Button>
+              </DialogActions>
+            </DialogBody></DialogSurface>
+          </Dialog>
+
+          {conversation.draft && <Dialog open onOpenChange={(_, data) => {
+            if (!data.open) conversationEditorRef.current?.cancel()
+          }}>
+            <DialogSurface className={styles.conversationSurface}>
+              <DialogBody>
+                <DialogTitle>{conversation.draft.sourceConversationId ? 'Edit conversation' : 'New conversation'}</DialogTitle>
+                <DialogContent className={styles.conversationContent}>
+                  <ConversationEditor key={conversation.draft.id} ref={conversationEditorRef} controller={conversation}
+                    saveDestination="new_attack" saveLabel="Add to attack"
+                    newAttackDisabledReason={!newAttackContext.ready ? 'Default labels are not ready.' : undefined}
+                    onSaved={(response: AddMessageResponse) => {
+                      updateScenarioParam(conversationParameter, response.messages.conversation_id)
+                      conversation.discard()
+                    }} />
+                </DialogContent>
+              </DialogBody>
+            </DialogSurface>
+          </Dialog>}
 
           <Dialog
             open={previewOpen}
@@ -1263,34 +1566,71 @@ function ScenarioLaunchForm({
               <DialogBody>
                 <DialogTitle>Run preview</DialogTitle>
                 <DialogContent className={styles.dialogContent}>
+                  {checkingRefreshPolicies && <Text role="status">Checking dataset refresh policies...</Text>}
+                  {unconfirmedRefreshPolicies && <MessageBar intent="warning">
+                    <MessageBarBody role="alert">
+                      Cannot confirm which datasets will refresh. The backend settings could not be checked for this
+                      request. A refresh replaces the full stored dataset, can remove manual edits, and can prevent
+                      older runs from resuming. Filters and objective limits do not limit replacement.
+                    </MessageBarBody>
+                  </MessageBar>}
+                  {refreshDatasets.length > 0 && <MessageBar intent="warning">
+                    <MessageBarBody role="alert">
+                      Refresh will replace the full stored datasets: {refreshDatasets.join(', ')}.
+                      Filters and objective limits do not limit replacement. This can remove manual edits
+                      and prevent older runs from resuming. Use a new dataset name to keep both batches.
+                      {editedRefreshDatasets.length > 0 && <Text block>
+                        User or unknown-origin data will be replaced: {editedRefreshDatasets.join(', ')}.
+                      </Text>}
+                      {uncheckedRefreshDatasets.length > 0 && <Text block>
+                        Existing data could not be checked for: {uncheckedRefreshDatasets.join(', ')}.
+                      </Text>}
+                    </MessageBarBody>
+                  </MessageBar>}
                   <dl className={styles.previewList}>
                     <div className={styles.previewGroup}>
-                      <dt>Target</dt>
-                      <dd>{targetName}</dd>
+                      {supportsObjectiveTarget && <>
+                        <dt>Objective Target</dt>
+                        <dd>{targetName}</dd>
+                      </>}
+                      {scenario.uses_default_adversarial_target && (
+                        <>
+                          <dt>Adversarial Target</dt>
+                          <dd>{adversarialTargetName || 'Use server default'}</dd>
+                        </>
+                      )}
                     </div>
-                    <div className={styles.previewGroup}>
+                    {(supportsTechniques || supportsBaseline) && <div className={styles.previewGroup}>
                       <dt>Techniques</dt>
                       <dd>
                         <div className={styles.previewBadges}>
-                          {baselineChecked && <Badge appearance="outline">baseline</Badge>}
-                          {selectedTechniques.map((name) => (
+                          {supportsBaseline && baselineChecked && !isBaselineForbidden
+                            && <Badge appearance="outline">baseline</Badge>}
+                          {supportsTechniques && selectedTechniques.map((name) => (
                             <Badge key={name} appearance="outline">{name}</Badge>
                           ))}
                         </div>
                       </dd>
-                    </div>
+                    </div>}
+                    {techniqueEditor.override && <div className={styles.previewGroup}>
+                      <dt>Run-local technique edits</dt>
+                      <dd><Text>The registered {techniqueEditor.override.source_name} stays unchanged.</Text>
+                        <pre className={styles.techniquePreview} aria-label="Technique edit preview">{JSON.stringify(techniqueEditor.override.changes, null, 2)}</pre>
+                      </dd>
+                    </div>}
+                    {supportsDatasets && <>
                     <div className={styles.previewGroup}>
                       <dt>Datasets</dt>
                       <dd>
                         <div className={styles.previewStack}>
                           <Text>
-                            {effectiveDatasets.length > 0
-                              ? effectiveDatasets.join(', ')
+                            {previewDatasetNames.length > 0
+                              ? previewDatasetNames.join(', ')
                               : 'No datasets declared'}
                           </Text>
                           <Text size={200} className={styles.hint}>
                             {previewDatasets.length > 0 ? 'Custom override' : 'Scenario defaults'}
-                            {maxDatasetSize.trim() ? ` - capped at ${maxDatasetSize.trim()} each` : ''}
+                            {` - dataset size: ${datasetSizeLabel}`}
                           </Text>
                         </div>
                       </dd>
@@ -1318,6 +1658,7 @@ function ScenarioLaunchForm({
                         )}
                       </dd>
                     </div>
+                    </>}
                     <div className={styles.previewGroup}>
                       <dt>Parameters</dt>
                       <dd>
@@ -1354,7 +1695,7 @@ function ScenarioLaunchForm({
                   </Button>
                   <Button
                     appearance="primary"
-                    disabled={submitting}
+                    disabled={submitting || conversationBusy || !runtime.ready || !defaultsReady || !requestResult.ok || checkingRefreshPolicies}
                     onClick={() => void handleLaunchConfirmed()}
                     data-testid="confirm-launch-scenario-btn"
                   >

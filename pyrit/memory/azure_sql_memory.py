@@ -1,7 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
+import asyncio
 import logging
+import os
 import struct
 import uuid
 from collections.abc import Mapping, Sequence
@@ -11,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy import (
     Integer,
+    String,
     Unicode,
     and_,
     bindparam,
@@ -18,16 +21,20 @@ from sqlalchemy import (
     event,
     exists,
     func,
+    literal,
     literal_column,
     text,
 )
+from sqlalchemy import cast as sql_cast
+from sqlalchemy.engine import make_url
 from sqlalchemy.engine.base import Engine
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import InstrumentedAttribute, sessionmaker
 from sqlalchemy.orm.session import Session
 from sqlalchemy.sql.expression import ColumnElement, TextClause
 
-from pyrit.auth.azure_auth import AzureAuth
+from pyrit.auth.azure_auth import AsyncAzureAuth, AzureAuth
 from pyrit.common import default_values
 from pyrit.common.singleton import Singleton
 from pyrit.memory.memory_interface import MemoryInterface
@@ -39,10 +46,11 @@ from pyrit.memory.memory_models import (
 )
 from pyrit.memory.memory_session import MemorySession
 from pyrit.memory.storage import AzureBlobStorageIO
-from pyrit.models import ConversationStats
+from pyrit.models import AttackResultRole, ConversationStats
 
 if TYPE_CHECKING:
     from azure.core.credentials import AccessToken
+    from sqlalchemy.sql import SQLColumnExpression
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +86,9 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         results_container_url: str | None = None,
         results_sas_token: str | None = None,
         verbose: bool = False,
-        skip_schema_migration: bool = False,
+        skip_schema_migration: bool = True,
         silent: bool = False,
+        _defer_initialization: bool = False,
     ) -> None:
         """
         Initialize an Azure SQL Memory backend.
@@ -92,7 +101,8 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             results_sas_token (str | None): The Shared Access Signature (SAS) token for the storage container.
                 If not provided, falls back to the 'AZURE_STORAGE_ACCOUNT_DB_DATA_SAS_TOKEN' environment variable.
             verbose (bool): Whether to enable verbose logging for the database engine. Defaults to False.
-            skip_schema_migration (bool): Whether to skip schema migration. Defaults to False.
+            skip_schema_migration (bool): Whether to skip schema migration. Defaults to True.
+                Set to False to explicitly migrate a non-production database during initialization.
             silent (bool): If True, suppresses schema migration console output. Defaults to False.
         """
         self._connection_string = default_values.get_required_value(
@@ -109,28 +119,43 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
 
         self._auth_token: AccessToken | None = None
         self._auth_token_expiry: int | None = None
+        self._async_auth: dict[asyncio.AbstractEventLoop, AsyncAzureAuth] = {}
+        self._verbose = verbose
+        self._silent = silent
+        self._skip_schema_migration = skip_schema_migration
 
         self.results_path = self._results_container_url
 
         self.engine = self._create_engine(has_echo=verbose)
 
         # Generate the initial auth token
-        self._create_auth_token()
+        if not _defer_initialization:
+            self._create_auth_token()
         # Enable token-based authorization
         self._enable_azure_authorization()
 
         self.SessionFactory = sessionmaker(bind=self.engine, class_=MemorySession)
 
+        if not _defer_initialization:
+            self._initialize_schema()
+
+        super().__init__()
+        self._initialized = not _defer_initialization
+
+    def _initialize_schema(self) -> None:
+        if os.environ.get("PYRIT_REQUIRE_CURRENT_SCHEMA") == "true":
+            self._check_schema_migration()
+            return
         prod_connection_string = default_values.get_non_required_value(
             env_var_name=self.AZURE_SQL_DB_CONNECTION_STRING_PROD
         )
 
         is_prod = bool(prod_connection_string) and self._connection_string == prod_connection_string
-        should_migrate = not is_prod and not skip_schema_migration
+        should_migrate = not is_prod and not self._skip_schema_migration
 
         if should_migrate:
             # Non-production: run schema migration (upgrade + check).
-            self._run_schema_migration(silent=silent)
+            self._run_schema_migration(silent=self._silent)
         else:
             # Production or skip_schema_migration=True: verify schema compatibility
             # without modifying the database. Logs a warning on mismatch but does not
@@ -138,7 +163,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             from alembic.util.exc import AutogenerateDiffsDetected, CommandError
 
             try:
-                self._check_schema_migration(silent=silent)
+                self._check_schema_migration()
             except (AutogenerateDiffsDetected, CommandError) as e:
                 logger.warning(
                     "Schema mismatch detected. "
@@ -147,7 +172,58 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
                     f"Schema was NOT modified. Details: {e}"
                 )
 
-        super().__init__()
+    def _create_async_engine(self) -> AsyncEngine:
+        import aioodbc
+
+        url = make_url(self._connection_string).set(drivername="mssql+aioodbc")
+
+        async def connect_async() -> aioodbc.Connection:
+            _, params = engine.dialect.create_connect_args(url)
+            dsn = ";".join(
+                part
+                for part in params.pop("dsn").split(";")
+                if part.partition("=")[0].strip().lower() != "trusted_connection"
+            )
+            token = await auth.get_access_token_async()
+            token_bytes = token.token.encode("utf-16-le")
+            attrs = dict(params.pop("attrs_before", {}))
+            attrs[self.SQL_COPT_SS_ACCESS_TOKEN] = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
+            connection: aioodbc.Connection = await aioodbc.connect(dsn=dsn, attrs_before=attrs, **params)
+            return connection
+
+        engine = create_async_engine(
+            url,
+            async_creator=connect_async,
+            pool_recycle=1800,
+            pool_pre_ping=True,
+            echo=self._verbose,
+        )
+        auth = AsyncAzureAuth(self.TOKEN_URL)
+        self._async_auth[asyncio.get_running_loop()] = auth
+        return engine
+
+    async def dispose_loop_resources_async(self) -> None:
+        """Close the current loop's engine and its owned Azure credential."""
+        loop = asyncio.get_running_loop()
+        for closed_loop in list(self._async_auth):
+            if closed_loop.is_closed():
+                await self._dispose_loop_resources_async(closed_loop)
+        await self._dispose_loop_resources_async(loop)
+
+    async def _dispose_loop_resources_async(self, loop: asyncio.AbstractEventLoop) -> None:
+        engine = self._async_engines.get(loop)
+        try:
+            if engine is not None:
+                if loop.is_closed():
+                    engine.sync_engine.dispose(close=False)
+                    logger.warning("Discarding Azure SQL pool owned by a closed event loop.")
+                else:
+                    await engine.dispose()
+        finally:
+            self._async_engines.pop(loop, None)
+            auth = self._async_auth.pop(loop, None)
+            if auth is not None:
+                await auth.close_async()
 
     @staticmethod
     def _resolve_sas_token(env_var_name: str, passed_value: str | None = None) -> str | None:
@@ -194,7 +270,8 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             RuntimeError: If auth token expiry was not initialized.
         """
         if self._auth_token_expiry is None:
-            raise RuntimeError("Auth token expiry not initialized; call _create_auth_token() first")
+            self._create_auth_token()
+            return
         if datetime.now(UTC) >= datetime.fromtimestamp(float(self._auth_token_expiry), tz=UTC) - timedelta(minutes=5):
             logger.info("Refreshing Microsoft Entra ID access token...")
             self._create_auth_token()
@@ -277,9 +354,11 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         are_label_parts: list[str] = []
         are_bindparams: dict[str, str] = {}
 
-        for key, value in memory_labels.items():
-            are_param = f"are_ml_{key}"
-            are_label_parts.append(f"JSON_VALUE(\"AttackResultEntries\".labels, '$.{key}') = :{are_param}")
+        for key_index, (key, value) in enumerate(memory_labels.items()):
+            path_param = f"are_ml_path_{key_index}"
+            are_param = f"are_ml_{key_index}"
+            are_label_parts.append(f'JSON_VALUE("AttackResultEntries".labels, :{path_param}) = :{are_param}')
+            are_bindparams[path_param] = f'$."{key}"'
             are_bindparams[are_param] = str(value)
 
         combined_are = " AND ".join(are_label_parts)
@@ -300,7 +379,9 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         """
         Generate SQL conditions for filtering by prompt metadata.
 
-        Uses JSON_VALUE() function specific to SQL Azure to query metadata fields in JSON format.
+        Uses OPENJSON() to compare free-form metadata keys literally rather than
+        interpreting them as JSON path expressions. Only strings, numbers, and
+        booleans match, preserving JSON_VALUE() scalar filtering semantics.
 
         Args:
             prompt_metadata (dict[str, str | int]): Dictionary of metadata key-value pairs to filter by.
@@ -309,15 +390,26 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             list: List containing a single SQLAlchemy text condition with bound parameters.
         """
         json_validation = "ISJSON(prompt_metadata) = 1"
-        json_conditions = " AND ".join([f"JSON_VALUE(prompt_metadata, '$.{key}') = :{key}" for key in prompt_metadata])
+        json_conditions, bindparams = [], {}
+        for index, (key, value) in enumerate(prompt_metadata.items()):
+            key_param, value_param = f"md_key_{index}", f"md_value_{index}"
+            alias = f"metadata_{index}"
+            json_conditions.append(
+                f"EXISTS (SELECT 1 FROM OPENJSON(prompt_metadata) AS [{alias}] "
+                f"WHERE [{alias}].[key] = :{key_param} "
+                f"AND DATALENGTH([{alias}].[key]) = DATALENGTH(CAST(:{key_param} AS NVARCHAR(MAX))) "
+                f"AND [{alias}].[type] IN (1, 2, 3) "
+                f"AND [{alias}].[value] = :{value_param})"
+            )
+            bindparams[key_param] = key
+            bindparams[value_param] = str(value)
+
         # Combine both conditions
-        conditions = f"{json_validation} AND {json_conditions}"
+        conditions = f"{json_validation} AND " + " AND ".join(json_conditions)
 
         # Create SQL condition using SQLAlchemy's text() with bindparams
         # for safe parameter passing, preventing SQL injection
-        # Note: JSON_VALUE always returns nvarchar in SQL Server, so we must convert all values to strings
-        # to avoid type conversion errors when comparing mixed types (e.g., int and string)
-        condition = text(conditions).bindparams(**{key: str(value) for key, value in prompt_metadata.items()})
+        condition = text(conditions).bindparams(**bindparams)
         return [condition]
 
     def _get_message_pieces_prompt_metadata_conditions(
@@ -474,17 +566,19 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         are_label_conditions: list[str] = []
         are_bindparams: dict[str, str] = {}
 
-        for key, raw_value in labels.items():
+        for key_index, (key, raw_value) in enumerate(labels.items()):
             values = [raw_value] if isinstance(raw_value, str) else list(raw_value)
             if not values:
                 continue
+            path_param = f"are_label_path_{key_index}"
+            are_bindparams[path_param] = f'$."{key}"'
             are_placeholders = []
             for idx, v in enumerate(values):
-                are_param = f"are_label_{key}_{idx}"
+                are_param = f"are_label_{key_index}_{idx}"
                 are_placeholders.append(f":{are_param}")
                 are_bindparams[are_param] = str(v)
             are_in = ", ".join(are_placeholders)
-            are_label_conditions.append(f"JSON_VALUE(\"AttackResultEntries\".labels, '$.{key}') IN ({are_in})")
+            are_label_conditions.append(f'JSON_VALUE("AttackResultEntries".labels, :{path_param}) IN ({are_in})')
 
         are_parts: list[Any] = [AttackResultEntry.labels.isnot(None)]
         if are_label_conditions:
@@ -497,7 +591,49 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             )
         return and_(*are_parts)
 
-    def get_unique_attack_class_names(self) -> list[str]:
+    def _get_attack_result_literal_label_condition(self, *, labels: dict[str, str | Sequence[str]]) -> Any:
+        """
+        Azure SQL implementation that matches label names literally through OPENJSON.
+
+        Keys and values are bound parameters, so no key becomes part of a JSON path or SQL text.
+        DATALENGTH keeps keys that differ only by trailing spaces apart, since SQL Server pads
+        strings before comparing them.
+
+        Returns:
+            Any: SQLAlchemy condition with bound parameters.
+        """
+        literal_conditions: list[str] = []
+        bindparams: dict[str, str] = {}
+        for key_index, (key, raw_value) in enumerate(labels.items()):
+            values = [raw_value] if isinstance(raw_value, str) else list(raw_value)
+            if not values:
+                continue
+            key_param = f"are_literal_key_{key_index}"
+            bindparams[key_param] = key
+            placeholders = []
+            for value_index, value in enumerate(values):
+                value_param = f"are_literal_{key_index}_{value_index}"
+                bindparams[value_param] = str(value)
+                placeholders.append(f":{value_param}")
+            literal_conditions.append(
+                'EXISTS (SELECT 1 FROM OPENJSON("AttackResultEntries".labels) AS label_entry '
+                f"WHERE label_entry.[key] = :{key_param} "
+                f"AND DATALENGTH(label_entry.[key]) = DATALENGTH(CAST(:{key_param} AS NVARCHAR(MAX))) "
+                f"AND label_entry.[value] IN ({', '.join(placeholders)}))"
+            )
+
+        parts: list[Any] = [AttackResultEntry.labels.isnot(None)]
+        if literal_conditions:
+            combined = " AND ".join(literal_conditions)
+            parts.append(
+                cast(
+                    "ColumnElement[bool]",
+                    text(f'ISJSON("AttackResultEntries".labels) = 1 AND {combined}').bindparams(**bindparams),
+                )
+            )
+        return and_(*parts)
+
+    def _execute_get_unique_attack_class_names(self) -> list[str]:
         """
         Azure SQL implementation: extract unique class_name values from
         the atomic_attack_identifier JSON column.
@@ -505,7 +641,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         Returns:
             Sorted list of unique attack class name strings.
         """
-        with closing(self.get_session()) as session:
+        with closing(self._get_session()) as session:
             rows = session.execute(
                 text(
                     """SELECT DISTINCT JSON_VALUE(atomic_attack_identifier,
@@ -518,7 +654,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             ).fetchall()
         return sorted(row[0] for row in rows)
 
-    def get_unique_converter_class_names(self) -> list[str]:
+    def _execute_get_unique_converter_class_names(self) -> list[str]:
         """
         Azure SQL implementation: extract unique converter class_name values
         from the children.attack_technique.children.attack.children.request_converters array
@@ -527,7 +663,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         Returns:
             Sorted list of unique converter class name strings.
         """
-        with closing(self.get_session()) as session:
+        with closing(self._get_session()) as session:
             rows = session.execute(
                 text(
                     """SELECT DISTINCT JSON_VALUE(c.value, '$.class_name') AS cls
@@ -540,7 +676,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             ).fetchall()
         return sorted(row[0] for row in rows)
 
-    def get_conversation_stats(self, *, conversation_ids: Sequence[str]) -> dict[str, ConversationStats]:
+    def _execute_get_conversation_stats(self, *, conversation_ids: Sequence[str]) -> dict[str, ConversationStats]:
         """
         Azure SQL implementation: lightweight aggregate stats per conversation.
 
@@ -588,7 +724,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             """
         )
 
-        with closing(self.get_session()) as session:
+        with closing(self._get_session()) as session:
             rows = session.execute(sql, params).fetchall()
 
         result: dict[str, ConversationStats] = {}
@@ -730,7 +866,29 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         """Return the persisted execution start without loading full scenario metadata."""
         return func.json_value(ScenarioResultEntry.scenario_metadata, "$.started_at")
 
-    def _get_scenario_attempt_unit_expressions(self) -> tuple[Any, Any, Any]:
+    def _get_scenario_attempt_id_order_expression(
+        self, *, attempt_id: "SQLColumnExpression[uuid.UUID]"
+    ) -> "SQLColumnExpression[str]":
+        # Native SQL Server UUID ordering differs from the SDK's canonical string comparison.
+        return func.lower(sql_cast(attempt_id, String(36))).collate("Latin1_General_100_BIN2")
+
+    def _get_scenario_role_match_condition(self, *, role_expression: Any, role: AttackResultRole) -> Any:
+        """
+        Return an exact case-sensitive and trailing-space-sensitive condition for AttackResultRole.
+
+        SQL Server pads strings for '=' comparisons and uses case-insensitive collation by default.
+        Binary collation ensures exact case matching, and DATALENGTH ensures trailing spaces or
+        malformed padding are not ignored.
+
+        Returns:
+            A SQL Server condition strictly matching the specified AttackResultRole.
+        """
+        return and_(
+            role_expression.collate("Latin1_General_100_BIN2") == role.value,
+            func.datalength(role_expression) == func.datalength(literal(role.value, type_=Unicode)),
+        )
+
+    def _get_scenario_attempt_unit_expressions(self) -> tuple[Any, Any, Any, Any]:
         """Return SQL Server JSON expressions for persisted scenario attempt attribution."""
         atomic_name = func.coalesce(
             func.json_value(AttackResultEntry.attribution_data, '$."parent_collection"'),
@@ -740,12 +898,21 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             func.json_value(AttackResultEntry.attribution_data, '$."parent_eval_hash"'),
             "",
         )
-        seed_group_id = func.coalesce(
+        attributed_seed_group_id = func.nullif(
             func.json_value(AttackResultEntry.attribution_data, '$."seed_group_id"'),
-            AttackResultEntry.objective_sha256,
             "",
         )
-        return atomic_name, technique_hash, seed_group_id
+        identifier_seed_key = literal_column(
+            f"""(
+                SELECT STRING_AGG(CAST(JSON_VALUE([attempt_seed].[value], '$.hash') AS NVARCHAR(MAX)), ',')
+                    WITHIN GROUP (ORDER BY CAST([attempt_seed].[key] AS INT))
+                FROM OPENJSON(
+                    [{AttackResultEntry.__tablename__}].[atomic_attack_identifier],
+                    '$.children.seed_identifiers'
+                ) AS [attempt_seed]
+            )"""
+        )
+        return atomic_name, technique_hash, attributed_seed_group_id, identifier_seed_key
 
     def _get_scenario_plan_unit_subqueries(self, *, scenario_result_ids: Sequence[uuid.UUID]) -> tuple[Any, Any]:
         """Return SQL Server run-plan expansions for planned units and planned seed groups."""
@@ -834,7 +1001,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         )
         return planned_units, plan_seeds
 
-    def get_session(self) -> Session:
+    def _get_sync_session(self) -> Session:
         """
         Provide a session for database operations.
 

@@ -3,11 +3,12 @@
 
 """Tests for Scenario custom parameter declaration, coercion, and validation (Stage 1b)."""
 
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 from unittest.mock import MagicMock
 
 import pytest
 
+from pyrit.common import REQUIRED_VALUE
 from pyrit.models import ComponentIdentifier, Parameter
 from pyrit.prompt_target import PromptTarget
 from pyrit.scenario import DatasetConfiguration
@@ -57,6 +58,9 @@ def _make_scenario(
             return {}
 
         async def _build_atomic_attacks_async(self, *, context):
+            return []
+
+        def _resolve_scenario_techniques(self, *, scenario_techniques: Any) -> list[ScenarioTechnique]:
             return []
 
     mock_scorer = MagicMock(spec=Scorer)
@@ -125,6 +129,23 @@ class TestSetParamsFromArgsScalarCoercion:
         scenario.set_params_from_args(args={"max_turns": "10"})
         assert scenario.params == {"max_turns": 10}
         assert isinstance(scenario.params["max_turns"], int)
+
+    def test_required_parameter_uses_the_shared_resolution_contract(self) -> None:
+        scenario = _make_scenario(
+            declared_params=[
+                Parameter(name="count", description="Required count", param_type=int, default=REQUIRED_VALUE)
+            ]
+        )
+        with pytest.raises(ValueError, match="required.*count"):
+            scenario.set_params_from_args(args={})
+        scenario.set_params_from_args(args={"count": "7"})
+        assert scenario.params == {"count": 7}
+
+    @pytest.mark.parametrize("value", [0.5, -0.5])
+    def test_int_rejects_fractional_native_values(self, value: float) -> None:
+        scenario = _make_scenario(declared_params=[Parameter(name="count", description="Count", param_type=int)])
+        with pytest.raises(ValueError, match="fractional part"):
+            scenario.set_params_from_args(args={"count": value})
 
     def test_float_coercion_from_string(self) -> None:
         scenario = _make_scenario(declared_params=[Parameter(name="threshold", description="d", param_type=float)])
@@ -456,7 +477,7 @@ class TestResumeParameterValidation:
     @classmethod
     def _make_stored_result(cls, *, scenario_name: str, version: int, params):
         """Build a minimal ScenarioResult with a controlled scenario identifier for resume tests."""
-        from tests.unit.mocks import make_scenario_result
+        from unit.mocks import make_scenario_result
 
         return make_scenario_result(
             scenario_name=scenario_name,
@@ -472,7 +493,7 @@ class TestResumeParameterValidation:
     @classmethod
     def _current_identifier(cls, *, scenario, version: int = 1, params):
         """Build the identifier that mirrors the current run for the given scenario."""
-        from tests.unit.mocks import make_scenario_identifier
+        from unit.mocks import make_scenario_identifier
 
         return make_scenario_identifier(
             scenario_name=type(scenario).__name__,
@@ -572,7 +593,9 @@ class TestParamPersistenceJsonSafety:
 
         await scenario.initialize_async()
 
-        stored = scenario._memory.get_scenario_results(scenario_result_ids=[scenario._scenario_result_id])[0]
+        stored = (
+            await scenario._memory.get_scenario_results_async(scenario_result_ids=[scenario._scenario_result_id])
+        )[0]
         assert stored.scenario_identifier.params["max_turns"] == 10
 
     async def test_non_json_safe_value_raises(self) -> None:

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   Button,
@@ -23,12 +23,17 @@ import {
 
 import { convertersApi, targetsApi } from '@/services/api'
 import { toApiError } from '@/services/errors'
-import type { ConverterInstance, ConverterTypeEntry, Parameter, TargetInstance } from '@/types'
+import { useTargetPreferences } from '@/hooks/useTargetPreferences'
+import type {
+  ConverterInstance, ConverterTypeEntry, Parameter, TargetInstance, SourceInstanceSpec, ConverterIdentifier,
+} from '@/types'
 import ParameterField from '@/components/Parameters/ParameterField'
 import {
   buildParametersFromForm,
   getInitialFormValues,
+  getParameterControlKind,
   isStructuredParameterFormValue,
+  type ParameterControlKind,
   type ParameterFormValue,
 } from '@/components/Parameters/parameterForm'
 
@@ -53,15 +58,25 @@ function getModalityLabel(converterType: ConverterTypeEntry): string {
   return `${inputs} to ${outputs}`
 }
 
+// Where a message came from decides whether it takes the keyboard: a failed
+// submission answers something the user just did, while a metadata-loading
+// failure arrives unprompted and must not pull focus out of the form.
+interface DialogError {
+  message: string
+  fromSubmit: boolean
+}
+
 interface CreateConverterDialogProps {
   open: boolean
   onClose: () => void
   onCreated: (converterId: string) => void
+  editing?: { converter: ConverterInstance; spec?: SourceInstanceSpec }
+  onTemporary?: (spec: SourceInstanceSpec, identifier: ConverterIdentifier) => void
 }
 
 interface ParameterInputProps {
   parameter: Parameter
-  referenceOptions: Array<{ name: string; type: string }>
+  referenceOptions: Array<{ name: string; type: string; isDefault?: boolean }>
   value: string
   showError: boolean
   onChange: (value: string) => void
@@ -109,6 +124,15 @@ function canConfigureConverterType(converterType: ConverterTypeEntry): boolean {
   )
 }
 
+// Text, JSON, and multiselect values go to the API exactly as entered: whitespace can be the
+// value (a replacement, for one), and this dialog shows those parameters as text or a single
+// select. The other controls are converted to the JSON type their parameter describes.
+const TYPED_CONTROL_KINDS = new Set<ParameterControlKind>(['structured', 'boolean', 'select', 'list', 'number'])
+
+function sendsTypedValue(parameter: Parameter): boolean {
+  return TYPED_CONTROL_KINDS.has(getParameterControlKind(parameter))
+}
+
 function parameterDefaultValue(parameter: Parameter): string {
   if (Array.isArray(parameter.default)) {
     return parameter.default.join(', ')
@@ -142,14 +166,16 @@ function ParameterInput({
     return (
       <Field
         label={label}
-        hint={`Select a registered ${parameter.reference_type}.`}
+        hint={parameter.reference_type === 'target'
+          ? `${parameter.name} is the target used by the converter to convert or rewrite the prompt. It uses the default adversarial target when available. You can select a different target.`
+          : `Select a registered ${parameter.reference_type}.`}
         validationMessage={showError ? 'Required' : undefined}
       >
         <Select value={value} onChange={(_, data) => onChange(data.value)}>
           <option value="">Select a registered {parameter.reference_type}</option>
           {referenceOptions.map((option) => (
             <option key={option.name} value={option.name}>
-              {option.name} ({option.type})
+              {option.name} ({option.type}){option.isDefault ? ' (default)' : ''}
             </option>
           ))}
         </Select>
@@ -231,21 +257,32 @@ export default function CreateConverterDialog({
   open,
   onClose,
   onCreated,
+  editing,
+  onTemporary,
 }: CreateConverterDialogProps) {
   const styles = useCreateConverterDialogStyles()
   const [converterTypes, setConverterTypes] = useState<ConverterTypeEntry[]>([])
   const [targets, setTargets] = useState<TargetInstance[]>([])
+  const { adversarialTarget } = useTargetPreferences(targets)
   const [converters, setConverters] = useState<ConverterInstance[]>([])
   const [selectedType, setSelectedType] = useState('')
   const [registryName, setRegistryName] = useState('')
   const [nameEdited, setNameEdited] = useState(false)
   const [parameterValues, setParameterValues] = useState<Record<string, ParameterFormValue>>({})
+  const [changedParameters, setChangedParameters] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [showValidation, setShowValidation] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<DialogError | null>(null)
+  const errorRef = useRef<HTMLDivElement>(null)
+  // The dialog instance is reused across openings, so a create response can
+  // land after the opening that started it has gone.
+  const openEpochRef = useRef(0)
 
   useEffect(() => {
+    // Every change of `open` ends the opening before it, so a response from the
+    // previous one leaves this opening's own state alone.
+    openEpochRef.current += 1
     if (!open) return
     let cancelled = false
     Promise.resolve()
@@ -253,6 +290,9 @@ export default function CreateConverterDialog({
         if (cancelled) return null
         setLoading(true)
         setError(null)
+        // A request from the previous opening keeps its own "Adding..." state, so
+        // clear it here rather than letting that response clear it for this one.
+        setSubmitting(false)
         return Promise.all([
           convertersApi.listConverterTypes(),
           targetsApi.listTargets(200),
@@ -263,11 +303,19 @@ export default function CreateConverterDialog({
         if (!responses) return
         const [response, targetResponse, converterResponse] = responses
         if (!cancelled) {
-          setConverterTypes(
-            response.items.filter(canConfigureConverterType),
-          )
+          setConverterTypes(editing ? response.items : response.items.filter(canConfigureConverterType))
           setTargets(targetResponse.items)
           setConverters(converterResponse.items)
+          if (editing) {
+            const entry = response.items.find((item) => item.converter_type === editing.converter.identifier.class_name)
+            setSelectedType(editing.converter.identifier.class_name)
+            const params: Record<string, unknown> = {
+              ...editing.converter.identifier,
+              ...editing.spec?.params,
+            }
+            setParameterValues(getInitialFormValues(entry?.parameters ?? [], params, { prefillDefaults: false }))
+            setChangedParameters(new Set())
+          }
         }
       })
       .catch((err) => {
@@ -275,14 +323,23 @@ export default function CreateConverterDialog({
           setConverterTypes([])
           setTargets([])
           setConverters([])
-          setError(toApiError(err).detail)
+          setError({ message: toApiError(err).detail, fromSubmit: false })
         }
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
       })
-    return () => { cancelled = true }
-  }, [open])
+    return () => { cancelled = true; openEpochRef.current += 1 }
+  }, [open, editing])
+
+  // Hand the keyboard to the failure once React has committed it. A frame
+  // callback can run before the render that adds the message bar, and focusing
+  // from there finds no node and silently does nothing, leaving the keyboard on
+  // the primary action where the request left it.
+  useEffect(() => {
+    if (!error?.fromSubmit) return
+    errorRef.current?.focus()
+  }, [error])
 
   const selectedConverterType = useMemo(
     () => converterTypes.find((item) => item.converter_type === selectedType),
@@ -303,11 +360,12 @@ export default function CreateConverterDialog({
       }))
   }, [converterTypes])
 
-  const referenceOptions = (parameter: Parameter): Array<{ name: string; type: string }> => {
+  const referenceOptions = (parameter: Parameter): Array<{ name: string; type: string; isDefault?: boolean }> => {
     if (parameter.reference_type === 'target') {
       return targets.map((target) => ({
         name: target.target_registry_name,
         type: target.identifier.class_name,
+        isDefault: target.target_registry_name === adversarialTarget?.target_registry_name,
       }))
     }
     if (parameter.reference_type === 'converter') {
@@ -324,6 +382,7 @@ export default function CreateConverterDialog({
     setRegistryName('')
     setNameEdited(false)
     setParameterValues({})
+    setChangedParameters(new Set())
     setShowValidation(false)
     setError(null)
   }
@@ -346,19 +405,29 @@ export default function CreateConverterDialog({
             && isEditableParameter(parameter) && parameter.default != null)
           .map((parameter) => [parameter.name, parameterDefaultValue(parameter)]),
       ),
+      ...(adversarialTarget ? Object.fromEntries(
+        parameters
+          .filter((parameter: Parameter) => !parameter.variants
+            && parameter.reference_type === 'target')
+          .map((parameter: Parameter) => [parameter.name, adversarialTarget.target_registry_name]),
+      ) : {}),
     })
     setShowValidation(false)
     setError(null)
   }
 
   const browse = (parameterName: string) => {
+    const epoch = openEpochRef.current
     const input = document.createElement('input')
     input.type = 'file'
     input.onchange = () => {
+      if (openEpochRef.current !== epoch) return
       const file = input.files?.[0]
       if (!file) return
       const reader = new FileReader()
       reader.onload = () => {
+        if (openEpochRef.current !== epoch) return
+        setChangedParameters((current) => new Set([...current, parameterName]))
         setParameterValues((current) => ({
           ...current,
           [parameterName]: String(reader.result ?? ''),
@@ -375,49 +444,89 @@ export default function CreateConverterDialog({
         && !parameter.default
         && !formValueIsSet(parameterValues[parameter.name]),
     )
-    if (!selectedType || !registryName.trim() || missingParameters) {
+    if (!selectedType || (!editing && (!registryName.trim() || missingParameters))) {
       setShowValidation(true)
       return
     }
 
-    const parameters = selectedConverterType?.parameters ?? []
-    const params = Object.fromEntries(
-      Object.entries(parameterValues).filter(([, value]) => !isStructuredParameterFormValue(value)),
+    const parameters = (selectedConverterType?.parameters ?? []).filter(
+      (parameter) => !editing || changedParameters.has(parameter.name),
     )
-    const structured = buildParametersFromForm(
-      parameters.filter((parameter) => parameter.variants),
-      parameterValues,
+    const params: Record<string, unknown> = Object.fromEntries(
+      parameters
+        .filter((parameter) => !sendsTypedValue(parameter))
+        .flatMap((parameter) => {
+          const value = parameterValues[parameter.name]
+          return typeof value === 'string' ? [[parameter.name, value]] : []
+        }),
     )
-    if (!structured.ok) {
-      setError(structured.error)
+    const typed = buildParametersFromForm(parameters.filter(sendsTypedValue), parameterValues)
+    if (!typed.ok) {
+      // Not tagged as a submission failure: nothing was disabled, so the keyboard
+      // is still on the primary action and has nothing to be restored from.
+      setError({ message: typed.error, fromSubmit: false })
       return
     }
-    if (structured.parameters) {
-      Object.assign(params, structured.parameters)
+    if (typed.parameters) {
+      Object.assign(params, typed.parameters)
     }
 
+    const epoch = openEpochRef.current
     setSubmitting(true)
     setError(null)
     try {
+      if (editing) {
+        if (!onTemporary) throw new Error('Temporary converter settings need an apply handler.')
+        const spec: SourceInstanceSpec = {
+          source_name: editing.spec?.source_name ?? editing.converter.converter_id,
+          source_hash: editing.spec?.source_hash ?? editing.converter.identifier.hash,
+          params: {
+            ...Object.fromEntries(Object.entries(editing.spec?.params ?? {})
+              .filter(([name]: [string, unknown]) => !changedParameters.has(name))),
+            ...params,
+          },
+        }
+        const response = await convertersApi.buildConverter(selectedType, spec)
+        if (openEpochRef.current === epoch) onTemporary(spec, response.identifier)
+        return
+      }
       const response = await convertersApi.createConverter({
         name: registryName.trim(),
         type: selectedType,
         params,
       })
-      reset()
+      // Only the opening this request was submitted from is cleared: a response
+      // that outlived its opening must not wipe the form the user is filling in
+      // now. onCreated stays ungated so a late success still refreshes the list.
+      if (openEpochRef.current === epoch) {
+        reset()
+      }
       onCreated(response.converter_id)
     } catch (err) {
-      setError(toApiError(err).detail)
+      // A failure from an opening the user has already left stays out of the
+      // one in front of them, and out of its focus.
+      if (openEpochRef.current === epoch) {
+        setError({ message: toApiError(err).detail, fromSubmit: true })
+      }
     } finally {
-      setSubmitting(false)
+      if (openEpochRef.current === epoch) {
+        setSubmitting(false)
+      }
     }
   }
+
+  // Disabled, but still focusable: a browser runs the unfocusing steps when the
+  // primary action is disabled for the request, which drops focus to <body> and
+  // out of the open dialog, and Escape then stops dismissing it because Tabster
+  // handles that key on the dialog surface. aria-disabled still blocks a second
+  // submit, because Fluent drops the click and key handlers instead.
+  const submitDisabled = loading || submitting || converterTypes.length === 0
 
   return (
     <Dialog open={open} onOpenChange={(_, data) => { if (!data.open) close() }}>
       <DialogSurface className={styles.surface}>
         <DialogBody>
-          <DialogTitle>Add Converter</DialogTitle>
+          <DialogTitle>{editing ? 'Converter Settings' : 'Add Converter'}</DialogTitle>
           <DialogContent className={styles.content}>
             <form
               className={styles.form}
@@ -428,10 +537,14 @@ export default function CreateConverterDialog({
             >
               {error && (
                 <MessageBar intent="error">
-                  <MessageBarBody>{error}</MessageBarBody>
+                  <MessageBarBody ref={errorRef} tabIndex={-1} role="alert">{error.message}</MessageBarBody>
                 </MessageBar>
               )}
               {loading && <Spinner label="Loading converter types..." />}
+              {editing && <Text>
+                Only changed fields replace source settings. These settings apply to this stage,
+                not the registered converter. Closing the converter pane discards them.
+              </Text>}
               {!loading && converterTypes.length === 0 && !error && (
                 <Text>No converter types are available.</Text>
               )}
@@ -444,13 +557,17 @@ export default function CreateConverterDialog({
                     validationMessage={showValidation && !selectedType ? 'Select a converter type' : undefined}
                   >
                     <Dropdown
+                      disabled={Boolean(editing)}
                       aria-label="Converter type"
                       className={styles.typeDropdown}
                       listbox={{ className: styles.typeListbox }}
                       placeholder="Select a converter type"
                       positioning={{
                         align: 'start',
+                        autoSize: 'height',
+                        fallbackPositions: ['above-start'],
                         matchTargetSize: 'width',
+                        overflowBoundary: 'window',
                         position: 'below',
                       }}
                       selectedOptions={selectedType ? [selectedType] : []}
@@ -508,7 +625,7 @@ export default function CreateConverterDialog({
                       </Text>
                     </div>
                   )}
-                  <Field
+                  {!editing && <Field
                     label="Registry name"
                     required
                     hint="The unique name used to select this configured converter."
@@ -523,7 +640,8 @@ export default function CreateConverterDialog({
                         setNameEdited(true)
                       }}
                     />
-                  </Field>
+                  </Field>}
+                  {editing && <Text>Changes apply only to this stage. The registered converter stays unchanged.</Text>}
                   <div className={styles.parameterGrid}>
                     {selectedConverterType?.parameters.map((parameter) => (
                       <div key={parameter.name} className={styles.parameterRow}>
@@ -534,10 +652,10 @@ export default function CreateConverterDialog({
                             disabled={submitting}
                             showRequiredError={showValidation && parameter.required}
                             testIdPrefix="structured"
-                            onChange={(name, value) => setParameterValues((current) => ({
-                              ...current,
-                              [name]: value,
-                            }))}
+                            onChange={(name, value) => {
+                              setChangedParameters((current) => new Set([...current, name]))
+                              setParameterValues((current) => ({ ...current, [name]: value }))
+                            }}
                           />
                         ) : <ParameterInput
                           parameter={parameter}
@@ -549,10 +667,10 @@ export default function CreateConverterDialog({
                             && !parameter.default
                             && !formValueIsSet(parameterValues[parameter.name])
                           }
-                          onChange={(value) => setParameterValues((current) => ({
-                            ...current,
-                            [parameter.name]: value,
-                          }))}
+                          onChange={(value) => {
+                            setChangedParameters((current) => new Set([...current, parameter.name]))
+                            setParameterValues((current) => ({ ...current, [parameter.name]: value }))
+                          }}
                           onBrowse={() => browse(parameter.name)}
                         />}
                       </div>
@@ -566,10 +684,11 @@ export default function CreateConverterDialog({
             <Button appearance="secondary" onClick={close}>Cancel</Button>
             <Button
               appearance="primary"
-              disabled={loading || submitting || converterTypes.length === 0}
+              disabled={submitDisabled}
+              disabledFocusable={submitDisabled}
               onClick={() => void submit()}
             >
-              {submitting ? 'Adding...' : 'Add Converter'}
+              {submitting ? editing ? 'Saving...' : 'Adding...' : editing ? 'Apply Settings' : 'Add Converter'}
             </Button>
           </DialogActions>
         </DialogBody>

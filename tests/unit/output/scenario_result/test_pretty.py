@@ -4,7 +4,7 @@
 import uuid
 
 import pytest
-from unit.mocks import make_scenario_result
+from unit.mocks import make_scenario_result, make_sequential_attack_results
 
 from pyrit.models import (
     AttackOutcome,
@@ -57,8 +57,8 @@ async def test_write_async_renders_full_summary(printer, capsys):
         target_params={"model_name": "gpt-test", "endpoint": "https://example.com"},
         attack_results={
             "technique_a": [
-                _attack_result(outcome=AttackOutcome.SUCCESS),
-                _attack_result(outcome=AttackOutcome.FAILURE),
+                _attack_result(outcome=AttackOutcome.SUCCESS, objective="obj1"),
+                _attack_result(outcome=AttackOutcome.FAILURE, objective="obj2"),
             ],
             "technique_b": [_attack_result(outcome=AttackOutcome.SUCCESS)],
         },
@@ -76,7 +76,8 @@ async def test_write_async_renders_full_summary(printer, capsys):
     assert "https://example.com" in out
     assert "Overall Statistics" in out
     assert "Total Techniques: 2" in out
-    assert "Total Attack Results: 3" in out
+    assert "Total Objective Executions: 3" in out
+    assert "Total Attempts: 3" in out
     assert "Per-Group Breakdown" in out
     assert "technique_a" in out
     assert "technique_b" in out
@@ -152,7 +153,9 @@ async def test_write_async_raises_when_scorer_identifier_present_without_scorer_
 )
 async def test_write_async_color_bands_for_success_rate(patch_central_database, capsys, expected_rate, attack_outcomes):
     p = PrettyScenarioResultMemoryPrinter(enable_colors=True)
-    result = _scenario_result(attack_results={"s": [_attack_result(outcome=o) for o in attack_outcomes]})
+    result = _scenario_result(
+        attack_results={"s": [_attack_result(outcome=o, objective=f"obj{i}") for i, o in enumerate(attack_outcomes)]}
+    )
     await p.write_async(result)
     out = capsys.readouterr().out
     assert f"Overall Success Rate: {expected_rate}%" in out
@@ -170,7 +173,7 @@ async def test_write_async_per_group_breakdown_with_display_group_map(printer, c
     await printer.write_async(result)
     out = capsys.readouterr().out
     assert "Group: Group X" in out
-    assert "Number of Results: 2" in out
+    assert "Objective Executions: 2" in out
 
 
 async def test_write_async_per_group_breakdown_with_empty_group(printer, capsys):
@@ -178,7 +181,7 @@ async def test_write_async_per_group_breakdown_with_empty_group(printer, capsys)
     await printer.write_async(result)
     out = capsys.readouterr().out
     assert "Group: empty_technique" in out
-    assert "Number of Results: 0" in out
+    assert "Objective Executions: 0" in out
     assert "Success Rate: 0%" in out
 
 
@@ -219,8 +222,8 @@ async def test_write_async_sorts_groups_by_success_rate_descending(patch_central
             "low": [_attack_result(outcome=AttackOutcome.FAILURE)],
             "high": [_attack_result(outcome=AttackOutcome.SUCCESS)],
             "mid": [
-                _attack_result(outcome=AttackOutcome.SUCCESS),
-                _attack_result(outcome=AttackOutcome.FAILURE),
+                _attack_result(outcome=AttackOutcome.SUCCESS, objective="obj1"),
+                _attack_result(outcome=AttackOutcome.FAILURE, objective="obj2"),
             ],
         },
     )
@@ -287,3 +290,22 @@ async def test_render_attacks_empty(printer):
     # Build directly (the _scenario_result helper substitutes a default for {}).
     text = await printer.render_async(make_scenario_result(attack_results={}), view="attacks")
     assert "No attack results" in text
+
+
+async def test_render_attacks_leaves_out_orchestration_envelope_and_labels_children_by_technique(printer):
+    envelope, children = make_sequential_attack_results(
+        atomic_attack_name="adaptive_text_airt_leakage::abc",
+        envelope_outcome=AttackOutcome.SUCCESS,
+        child_outcomes=[AttackOutcome.FAILURE, AttackOutcome.SUCCESS],
+        child_technique_names=["crescendo", "role_play"],
+    )
+    result = _scenario_result(attack_results={"adaptive_text_airt_leakage::abc": [*children, envelope]})
+
+    text = await printer.render_async(result, view="attacks")
+
+    assert envelope.attack_result_id not in text
+    assert all(child.attack_result_id in text for child in children)
+    assert "technique: crescendo" in text
+    assert "technique: role_play" in text
+    assert "technique: adaptive_text_airt_leakage::abc" not in text
+    assert "Total attacks: 2" in text

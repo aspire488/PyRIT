@@ -17,6 +17,7 @@ STAGE_TEMPLATE = REPO_ROOT / "infra" / "pipelines" / "deploy-stage.yml"
 WHAT_IF_VALIDATOR = REPO_ROOT / "infra" / "pipelines" / "validate_what_if.py"
 RESOURCE_GROUP_ID = "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/copyrit-prod-v2"
 APP_ID = f"{RESOURCE_GROUP_ID}/providers/Microsoft.App/containerApps/copyrit-prod-v2"
+JOB_ID = f"{RESOURCE_GROUP_ID}/providers/Microsoft.App/jobs/copyrit-prod-v2-migrate"
 ENVIRONMENT_ID = f"{RESOURCE_GROUP_ID}/providers/Microsoft.App/managedEnvironments/copyrit-prod-v2-env"
 PIP_ID = f"{RESOURCE_GROUP_ID}/providers/Microsoft.Network/publicIPAddresses/copyrit-prod-v2-egress-pip"
 NAT_ID = f"{RESOURCE_GROUP_ID}/providers/Microsoft.Network/natGateways/copyrit-prod-v2-nat"
@@ -35,6 +36,16 @@ class TestPipelineGuardrails(unittest.TestCase):
             for stage in cls.pipeline["stages"]
             if "template" in stage
         }
+
+    def test_published_images_require_verified_clean_source_provenance(self) -> None:
+        assert "source_commit=$(git rev-parse HEAD)" in self.pipeline_text
+        assert '"$source_commit" != "$PYRIT_SOURCE_VERSION"' in self.pipeline_text
+        assert '-n "$(git status --porcelain)"' in self.pipeline_text
+        assert '--build-arg GIT_COMMIT="$source_commit"' in self.pipeline_text
+        assert "--build-arg GIT_MODIFIED=false" in self.pipeline_text
+        assert self.pipeline_text.index("source_commit=$(git rev-parse HEAD)") < self.pipeline_text.index(
+            "docker build"
+        )
 
     def test_all_deployment_stages_share_one_template_and_remain_visible(self) -> None:
         stages = self.pipeline["stages"]
@@ -225,6 +236,7 @@ class TestWhatIfPolicies(unittest.TestCase):
                 arguments += ["--deployment-mode", mode]
             if app_id is not None:
                 arguments += ["--expected-app-id", app_id]
+            arguments += ["--expected-job-id", JOB_ID]
             return subprocess.run(arguments, capture_output=True, text=True, check=False)
 
     def test_infrastructure_accepts_read_only_normalization_and_lock_create(self) -> None:
@@ -256,6 +268,10 @@ class TestWhatIfPolicies(unittest.TestCase):
             ("infra", APP_ID, "NoChange", True),
             ("infra", APP_ID.upper() + "/", "Modify", False),
             ("infra", APP_ID + "/authConfigs/current", "Modify", False),
+            ("job", JOB_ID, "Create", True),
+            ("job", JOB_ID, "Modify", True),
+            ("job", APP_ID, "Modify", False),
+            ("job", f"{RESOURCE_GROUP_ID}/providers/Microsoft.App/jobs/other-job", "Create", False),
         ):
             with self.subTest(mode=mode, resource_id=resource_id, change_type=change_type):
                 result = self._run_validator(

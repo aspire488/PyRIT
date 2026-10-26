@@ -89,10 +89,10 @@ class XLSafetyBenchCulturalCategory(str, Enum):
     """Cultural categories used by the XL-SafetyBench Cultural track."""
 
     SYMBOLIC_TABOOS_AND_GIFT_GIVING = "Symbolic Taboos & Gift-Giving"
-    FOOD_DIETARY_LAW_AND_HOSPITALITY = "Food Dietary Law & Hospitality"
-    DEATH_GRIEF_AND_FUNERAL_PRACTICES = "Death Grief & Funeral Practices"
+    FOOD_DIETARY_LAW_AND_HOSPITALITY = "Food, Dietary Law & Hospitality"
+    DEATH_GRIEF_AND_FUNERAL_PRACTICES = "Death, Grief & Funeral Practices"
     DAILY_LIFE_AND_PUBLIC_CONDUCT = "Daily Life & Public Conduct"
-    HIERARCHY_ADDRESS_AND_SOCIAL_DEFERENCE = "Hierarchy Address & Social Deference"
+    HIERARCHY_ADDRESS_AND_SOCIAL_DEFERENCE = "Hierarchy, Address & Social Deference"
     LEGAL_LANDMINES = "Legal Landmines"
 
 
@@ -372,7 +372,7 @@ class _XLSafetyBenchJailbreakDataset(_RemoteDatasetLoader):
         """The dataset name."""
         return "xl_safety_bench_jailbreak"
 
-    async def fetch_dataset_async(self, *, cache: bool = True) -> SeedDataset:
+    async def _fetch_dataset_async(self, *, cache: bool = True) -> SeedDataset:
         """
         Fetch XL-SafetyBench jailbreak prompts and return them as a SeedDataset.
 
@@ -548,7 +548,7 @@ class _XLSafetyBenchJailbreakObjectivesDataset(_RemoteDatasetLoader):
         """The dataset name."""
         return "xl_safety_bench_jailbreak_objectives"
 
-    async def fetch_dataset_async(self, *, cache: bool = True) -> SeedDataset:
+    async def _fetch_dataset_async(self, *, cache: bool = True) -> SeedDataset:
         """
         Fetch XL-SafetyBench jailbreak objectives and return them as a SeedDataset.
 
@@ -728,7 +728,7 @@ class _XLSafetyBenchCulturalDataset(_RemoteDatasetLoader):
         """The dataset name."""
         return "xl_safety_bench_cultural"
 
-    async def fetch_dataset_async(self, *, cache: bool = True) -> SeedDataset:
+    async def _fetch_dataset_async(self, *, cache: bool = True) -> SeedDataset:
         """
         Fetch XL-SafetyBench cultural scenarios and return them as a SeedDataset.
 

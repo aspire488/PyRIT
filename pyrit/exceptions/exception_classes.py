@@ -7,7 +7,7 @@ import os
 import uuid
 from abc import ABC
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 from openai import RateLimitError
 from tenacity import (
@@ -25,6 +25,8 @@ from pyrit.exceptions.exceptions_helpers import log_exception
 from pyrit.models import Message, MessagePiece, construct_response_from_request
 
 logger = logging.getLogger(__name__)
+_RetryParams = ParamSpec("_RetryParams")
+_RetryResult = TypeVar("_RetryResult")
 
 
 def _get_custom_result_retry_max_num_attempts() -> int:
@@ -225,6 +227,20 @@ class EmptyResponseException(BadRequestException):
         super().__init__(status_code=status_code, message=message)
 
 
+class AdversarialChatResponseBlockedException(BadRequestException):
+    """Exception raised when an adversarial chat refuses or filters its response."""
+
+
+class AdversarialChatRefusedException(AdversarialChatResponseBlockedException):
+    """
+    Exception raised when the adversarial model itself declined to generate an attacker turn.
+
+    Subclasses ``AdversarialChatResponseBlockedException`` because both leave the attack
+    with no prompt to send, so existing handlers keep working. Callers that need to tell a
+    deliberate model refusal apart from an infrastructure content filter can catch this first.
+    """
+
+
 class ScorerLLMResponseBlockedException(BadRequestException):
     """Exception raised when a scorer's own LLM response is blocked by content filtering."""
 
@@ -331,7 +347,7 @@ class ExperimentalWarning(FutureWarning):
 
 def pyrit_custom_result_retry(
     retry_function: Callable[..., bool], retry_max_num_attempts: int | None = None
-) -> Callable[..., Any]:
+) -> Callable[[Callable[_RetryParams, _RetryResult]], Callable[_RetryParams, _RetryResult]]:
     """
     Apply retry logic with exponential backoff to a function.
 
@@ -350,7 +366,7 @@ def pyrit_custom_result_retry(
 
     """
 
-    def inner_retry(func: Callable[..., Any]) -> Callable[..., Any]:
+    def inner_retry(func: Callable[_RetryParams, _RetryResult]) -> Callable[_RetryParams, _RetryResult]:
         # Use static value if explicitly provided, otherwise use dynamic getter
         stop_strategy: stop_base
         if retry_max_num_attempts is not None:
@@ -457,7 +473,8 @@ def pyrit_placeholder_retry(func: Callable[..., Any]) -> Callable[..., Any]:
 #                                    and OpenAI moderation's ``usage_policy_violation``.
 #   - ``moderation_blocked``       - OpenAI moderation ``error.code``.
 #   - ``bio_policy`` / ``cyber_policy`` - Biological / cybersecurity policy blocks;
-#                                    observed in HTTP 400s and handled by OpenAI Codex.
+#                                    observed in Azure OpenAI ``error.code`` on HTTP 400s
+#                                    and handled by OpenAI Codex.
 CONTENT_FILTER_MARKERS = frozenset(
     {
         "content_filter",

@@ -19,6 +19,28 @@ def azure_blob_storage_io():
     return AzureBlobStorageIO(container_url="dummy")
 
 
+async def test_disk_storage_deletes_only_requested_file_async(tmp_path: Path) -> None:
+    storage = DiskStorageIO()
+    owned, neighbor = tmp_path / "owned.txt", tmp_path / "neighbor.txt"
+    await storage.write_file_async(owned, b"remove")
+    await storage.write_file_async(neighbor, b"keep")
+    await storage.delete_file_async(owned)
+    await storage.delete_file_async(owned)
+    assert not await storage.path_exists_async(owned)
+    assert await storage.read_file_async(neighbor) == b"keep"
+
+
+async def test_blob_storage_deletion_closes_client_on_failure_async() -> None:
+    storage = AzureBlobStorageIO(container_url="https://account.blob.core.windows.net/container")
+    client = AsyncMock()
+    client.delete_blob.side_effect = OSError("storage unavailable")
+    storage._client_async = client
+    with pytest.raises(OSError, match="storage unavailable"):
+        await storage.delete_file_async("https://account.blob.core.windows.net/container/owned.txt")
+    client.delete_blob.assert_awaited_once_with("owned.txt")
+    client.close.assert_awaited_once()
+
+
 async def test_disk_storage_io_read_file():
     storage = DiskStorageIO()
     path = "sample.txt"
@@ -342,9 +364,24 @@ def test_azure_storage_io_parse_blob_url_without_netloc(azure_blob_storage_io):
         azure_blob_storage_io.parse_blob_url("https:///container/dir1/blob_name.txt")
 
 
+def test_azure_storage_io_parse_blob_url_without_container_path(azure_blob_storage_io):
+    with pytest.raises(ValueError, match="Invalid blob URL"):
+        azure_blob_storage_io.parse_blob_url("https://example.blob.core.windows.net")
+
+
+def test_azure_storage_io_parse_blob_url_with_empty_container_name(azure_blob_storage_io):
+    with pytest.raises(ValueError, match="Invalid blob URL"):
+        azure_blob_storage_io.parse_blob_url("https://example.blob.core.windows.net/")
+
+
 def test_resolve_blob_name_with_full_url(azure_blob_storage_io):
     result = azure_blob_storage_io._resolve_blob_name("https://account.blob.core.windows.net/container/dir1/file.txt")
     assert result == "dir1/file.txt"
+
+
+def test_resolve_blob_name_without_container_falls_back_to_path(azure_blob_storage_io):
+    file_path = "https://account.blob.core.windows.net"
+    assert azure_blob_storage_io._resolve_blob_name(file_path) == file_path
 
 
 def test_resolve_blob_name_with_relative_path(azure_blob_storage_io):

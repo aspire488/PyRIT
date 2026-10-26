@@ -61,16 +61,19 @@ initializers:
   # server.startup_timeout below.
   # - name: load_default_datasets
 
-# Operator and Operation Labels
-# ------------------------------
-# Default labels applied to all attacks created with PyRIT.
+  # Operator and Operation Defaults
+# -------------------------------
+# GUI defaults for new attacks and scans.
 #
 # - operator: Identifies who is running the attack (e.g., your team name or alias).
-# - operation: Groups related attacks under a campaign or engagement name.
+# - operation: Proposes a saved Operation name to group new activity under. It is
+#   never created automatically: until it is saved, the GUI highlights it as not
+#   registered and each user chooses an existing Operation, registers it, or
+#   clears it.
 #
 # Both are optional.
 operator: roakey
-operation: op_trash_panda
+# operation: my_engagement
 
 # Initialization Scripts
 # ----------------------
@@ -111,6 +114,15 @@ operation: op_trash_panda
 # Applies only to the pyrit_backend server.
 max_concurrent_scenario_runs: 3
 
+# Live Reinitialization
+# ---------------------
+# Allows administrators to apply saved configuration changes without restarting
+# the backend. Enable only when the deployment has exactly one backend process
+# and one replica. Known worker and replica settings are checked as an additional
+# safeguard. Live apply rejects busy runtimes and requires a restart if
+# initialization fails after replacement begins.
+enable_live_reinitialization: false
+
 # Custom Initializer Registration (REST API)
 # -------------------------------------------
 # When true, the REST API accepts POST /api/initializers to register custom
@@ -129,7 +141,33 @@ allow_custom_initializers: false
 # directory or an Azure Blob container URI with an optional blob prefix.
 # Container URIs may include a SAS; otherwise DefaultAzureCredential is used. Defaults to
 # ~/.pyrit/custom_initializers.
+#
+# ⚠️  WARNING: When allow_custom_initializers is true, the backend runs every script
+# in this source at startup and live reinitialization. Anyone who can write to this
+# source, or to this configuration file, can run code as the backend. Restrict write
+# access to trusted administrators.
 # custom_initializers_source: https://account.blob.core.windows.net/container/custom_initializers
+
+# Optional storage for scenario presets, the saved scenario configurations the
+# scanner UI launches from. This may be a local directory or an Azure Blob
+# container URI with an optional blob prefix. Container URIs may include a SAS;
+# otherwise DefaultAzureCredential is used. Defaults to ~/.pyrit/scenario_presets.
+# scenario_presets_source: https://account.blob.core.windows.net/container/scenario_presets
+
+# Optional storage for ScenarioSuite definitions, which contain ordered references
+# to scenario presets. This supports the same local directory and Azure Blob
+# sources as scenario_presets_source. Defaults to ~/.pyrit/scenario_suites.
+# scenario_suites_source: https://account.blob.core.windows.net/container/scenario_suites
+
+# Upload Folder for API-Created Targets
+# -------------------------------------
+# Folder that targets created through the REST API may upload local files from
+# (HTTPXAPITarget). The server passes it to the target; API callers cannot choose it.
+# When unset, those targets cannot be created through the API; register them in
+# Python or with an initializer instead.
+#
+# Default: unset
+# target_upload_directory: /path/to/upload/files
 
 # Local Backend Server
 # --------------------

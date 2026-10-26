@@ -6,6 +6,7 @@ import tempfile
 import uuid
 from collections.abc import MutableSequence
 from datetime import UTC, datetime, timedelta
+from typing import assert_type
 from unittest.mock import patch
 
 import pytest
@@ -14,9 +15,11 @@ from unit.mocks import get_sample_conversations
 from pyrit.converter import Base64Converter
 from pyrit.memory.storage.serializers import set_message_piece_sha256_async
 from pyrit.models import (
+    ChatMessageRole,
     ComponentIdentifier,
     Message,
     MessagePiece,
+    RequestTraceContext,
     Score,
     construct_response_from_request,
     flatten_to_message_pieces,
@@ -24,6 +27,27 @@ from pyrit.models import (
     group_message_pieces_into_conversations,
     sort_message_pieces,
 )
+
+
+@pytest.mark.parametrize(
+    ("role", "expected_role", "api_role"),
+    [("assistant", "simulated_assistant", "assistant"), ("tool", "simulated_tool", "tool"), ("user", "user", "user")],
+)
+def test_simulated_history_provenance(
+    *, role: ChatMessageRole, expected_role: ChatMessageRole, api_role: ChatMessageRole
+) -> None:
+    piece = MessagePiece(role=role, original_value="history")
+    piece.prompt_metadata.update(RequestTraceContext(traceparent=f"00-{'1' * 32}-{'2' * 16}-01").to_metadata())
+    piece.prompt_metadata[RequestTraceContext.REQUEST_METADATA_KEY] = 1
+    piece.set_simulated_role()
+    piece.set_simulated_role()
+    restored = MessagePiece.model_validate_json(piece.model_dump_json())
+    assert restored.role == expected_role
+    assert restored.api_role == api_role
+    assert restored.is_simulated is (role != "user")
+    assert restored.prompt_metadata[MessagePiece.PREPENDED_HISTORY_METADATA_KEY] is True
+    assert RequestTraceContext.from_metadata(restored.prompt_metadata) is None
+    assert RequestTraceContext.REQUEST_METADATA_KEY not in restored.prompt_metadata
 
 
 @pytest.fixture
@@ -38,6 +62,25 @@ def test_id_set():
         converted_value="Hello",
     )
     assert entry.id is not None
+
+
+@pytest.mark.parametrize(
+    ("converted_fields", "expected_value"),
+    [
+        ({}, "Original source"),
+        ({"converted_value": None}, "Original source"),
+        ({"converted_value": ""}, ""),
+        ({"converted_value": "Converted"}, "Converted"),
+    ],
+)
+def test_converted_value_defaults_only_when_missing_or_null(
+    *, converted_fields: dict[str, str | None], expected_value: str
+) -> None:
+    piece = MessagePiece.model_validate({"role": "user", "original_value": "Original source", **converted_fields})
+
+    assert piece.original_value == "Original source"
+    assert piece.converted_value == expected_value
+    assert MessagePiece.model_validate(piece.model_dump()).converted_value == expected_value
 
 
 def test_datetime_set():
@@ -818,6 +861,19 @@ def test_message_piece_has_error_and_is_blocked_consistency():
     )
     assert blocked_entry.is_blocked() is True
     assert blocked_entry.has_error() is True
+
+
+class _CustomMessagePiece(MessagePiece):
+    """A subclass used to check classmethod factory return types."""
+
+
+def test_adversarial_placeholder_factory_returns_calling_subclass():
+    piece = _CustomMessagePiece.adversarial_placeholder(role="assistant")
+
+    assert_type(piece, _CustomMessagePiece)
+    assert type(piece) is _CustomMessagePiece
+    assert piece.role == "assistant"
+    assert piece.is_adversarial_placeholder() is True
 
 
 def test_adversarial_placeholder_factory_defaults():

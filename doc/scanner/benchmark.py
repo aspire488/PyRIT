@@ -34,13 +34,17 @@
 #   --target openai_chat \
 #   --adversarial-targets adversarial_chat \
 #   --techniques role_play_video_game \
-#   --max-dataset-size 1
+#   --max-total 1
 # ```
 #
 # Pass multiple `--adversarial-targets` values to compare across models in a single run.
 #
 # **Default techniques:** `role_play_video_game`, `crescendo_simulated`, and `tap`. TAP's
 # branching search makes this default slower and more expensive than the former `light` default.
+# Every selected adversarial technique prepends one shared benchmark guidance layer to its native
+# system prompt, including explicitly selected techniques such as `red_teaming`. The native strategy,
+# template parameters, and response format remain the source of truth. Global registered factories
+# and techniques used outside this benchmark remain unchanged.
 # For a cheaper run, explicitly pass `--techniques light`.
 #
 # **Other available selections:** `light`, `single_turn`, `multi_turn`, plus one member per
@@ -52,7 +56,7 @@
 # %%
 from pyrit.output import output_scenario_async
 from pyrit.prompt_target import OpenAIChatTarget
-from pyrit.scenario import DatasetAttackConfiguration
+from pyrit.scenario import DatasetAttackConfiguration, DatasetSource
 from pyrit.scenario.benchmark import AdversarialBenchmark
 from pyrit.setup import IN_MEMORY, initialize_pyrit_async
 from pyrit.setup.initializers import ScorerInitializer, TargetInitializer, TechniqueInitializer
@@ -67,7 +71,7 @@ objective_target = OpenAIChatTarget()
 # %%
 from pyrit.scenario.benchmark import AdversarialBenchmarkTechnique
 
-dataset_config = DatasetAttackConfiguration(dataset_names=["harmbench"], max_dataset_size=1)
+dataset_config = DatasetAttackConfiguration(sources=[DatasetSource(name="harmbench")], max_total=1)
 
 scenario = AdversarialBenchmark()
 scenario.set_params_from_args(

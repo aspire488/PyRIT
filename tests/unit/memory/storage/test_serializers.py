@@ -14,11 +14,13 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import pytest
 from PIL import Image
 
+from pyrit.memory import MemoryInterface
 from pyrit.memory.storage import (
     AllowedCategories,
     AzureBlobStorageIO,
     BinaryPathDataTypeSerializer,
     DataTypeSerializer,
+    DiskStorageIO,
     ErrorDataTypeSerializer,
     ImagePathDataTypeSerializer,
     StorageIO,
@@ -284,14 +286,58 @@ async def test_get_sha256_from_image_file(sqlite_instance):
     assert sha256_hash == expected_hash
 
 
-def test_is_azure_storage_url(sqlite_instance):
-    """Test Azure Storage URL validation."""
-    valid_url = "https://mystorageaccount.blob.core.windows.net/container/file.txt"
-    invalid_url = "https://example.com/file.txt"
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("https://account.blob.core.windows.net/container/file.txt", True),
+        ("http://account.blob.core.windows.net/container/file.txt", True),
+        ("https://ACCOUNT.BLOB.CORE.WINDOWS.NET/container/file.txt", True),
+        ("https://account.blob.core.windows.net:443/container/file.txt", True),
+        ("http://account.blob.core.windows.net:8080/container/file.txt", True),
+        ("https://account.blob.core.windows.net/container/file.txt?sig=token#fragment", True),
+        ("https://account.blob.core.windows.net", True),
+        ("https://blob.core.windows.net.attacker.example/container/file.txt", False),
+        ("https://account.blob.core.windows.net.attacker.example/container/file.txt", False),
+        ("https://blob.core.windows.net@attacker.example/container/file.txt", False),
+        ("https://account.blob.core.windows.net:password@attacker.example/container/file.txt", False),
+        ("https://notblob.core.windows.net/container/file.txt", False),
+        ("https://blob.core.windows.net/container/file.txt", False),
+        ("https://example.com/blob.core.windows.net/file.txt", False),
+        ("https://example.com/file.txt?host=account.blob.core.windows.net", False),
+        ("ftp://account.blob.core.windows.net/container/file.txt", False),
+        ("//account.blob.core.windows.net/container/file.txt", False),
+        ("https:///container/file.txt", False),
+        (r"C:\data\blob.core.windows.net\file.txt", False),
+        ("", False),
+    ],
+)
+def test_is_azure_storage_url(*, path: str, expected: bool) -> None:
+    serializer = TextDataTypeSerializer(prompt_text="")
+    assert serializer._is_azure_storage_url(path) is expected
 
-    serializer = data_serializer_factory(category="prompt-memory-entries", data_type="url", value=valid_url)
-    assert serializer._is_azure_storage_url(valid_url) is True
-    assert serializer._is_azure_storage_url(invalid_url) is False
+
+@pytest.mark.parametrize(
+    ("path", "expected_azure"),
+    [
+        ("https://account.blob.core.windows.net/container/file.png", True),
+        ("http://otheraccount.blob.core.windows.net/othercontainer/file.png", True),
+        ("https://account.blob.core.windows.net.attacker.example/container/file.png", False),
+        ("https://blob.core.windows.net@attacker.example/container/file.png", False),
+    ],
+)
+def test_get_storage_io_selects_by_hostname(*, path: str, expected_azure: bool) -> None:
+    storage = AzureBlobStorageIO(container_url="https://account.blob.core.windows.net/container")
+    mock_memory = MagicMock(spec=MemoryInterface)
+    mock_memory.results_storage_io = storage
+    serializer = data_serializer_factory(category="prompt-memory-entries", data_type="image_path", value=path)
+
+    with patch.object(type(serializer), "_memory", new_callable=PropertyMock, return_value=mock_memory):
+        selected_storage = serializer._get_storage_io()
+
+    if expected_azure:
+        assert selected_storage is storage
+    else:
+        assert isinstance(selected_storage, DiskStorageIO)
 
 
 async def test_read_data_local_file_with_dummy_image(sqlite_instance):
@@ -358,7 +404,7 @@ async def test_get_data_filename_preserves_dotted_basename(sqlite_instance):
 
 async def test_concurrent_default_filenames_are_unique_and_preserve_payloads(tmp_path: Path) -> None:
     storage = ConcurrentWriteStorageIO()
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_memory.results_path = tmp_path
     mock_memory.results_storage_io = storage
     serializers = [
@@ -390,7 +436,7 @@ async def test_concurrent_default_filenames_are_unique_and_preserve_payloads(tmp
 
 async def test_save_data_supports_legacy_storage_io_write_signature():
     storage = LegacyStorageIO()
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_memory.results_path = "https://account.blob.core.windows.net/container/results"
     mock_memory.results_storage_io = storage
     serializer = data_serializer_factory(category="prompt-memory-entries", data_type="image_path")
@@ -439,7 +485,7 @@ async def test_binary_path_default_extension_sets_azure_content_type():
     storage = AzureBlobStorageIO(container_url="https://account.blob.core.windows.net/container")
     mock_container_client = AsyncMock()
     storage._client_async = mock_container_client
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_memory.results_path = "https://account.blob.core.windows.net/container/results"
     mock_memory.results_storage_io = storage
     serializer = data_serializer_factory(category="prompt-memory-entries", data_type="binary_path")
@@ -488,7 +534,7 @@ async def test_binary_path_subdirectory(sqlite_instance):
 def test_get_storage_io_raises_when_results_storage_io_none():
     serializer = data_serializer_factory(category="prompt-memory-entries", data_type="image_path")
     serializer.value = "https://account.blob.core.windows.net/container/path/image.png"
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_memory.results_storage_io = None
     with patch.object(type(serializer), "_memory", new_callable=PropertyMock, return_value=mock_memory):
         with pytest.raises(RuntimeError, match="results_storage_io is not configured"):
@@ -497,7 +543,7 @@ def test_get_storage_io_raises_when_results_storage_io_none():
 
 async def test_save_data_raises_when_results_storage_io_none():
     serializer = data_serializer_factory(category="prompt-memory-entries", data_type="image_path")
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_memory.results_storage_io = None
     with patch.object(type(serializer), "_memory", new_callable=PropertyMock, return_value=mock_memory):
         with patch.object(
@@ -509,7 +555,7 @@ async def test_save_data_raises_when_results_storage_io_none():
 
 async def test_save_b64_image_raises_when_results_storage_io_none():
     serializer = data_serializer_factory(category="prompt-memory-entries", data_type="image_path")
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_memory.results_storage_io = None
     with patch.object(type(serializer), "_memory", new_callable=PropertyMock, return_value=mock_memory):
         with patch.object(
@@ -526,7 +572,7 @@ async def test_save_formatted_audio_raises_when_results_storage_io_none():
     from pyrit.memory.storage import data_serializer_factory as factory
 
     serializer = factory(category="prompt-memory-entries", data_type="audio_path")
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_memory.results_storage_io = None
     azure_url = "https://account.blob.core.windows.net/container/audio/test.wav"
     with patch.object(type(serializer), "_memory", new_callable=PropertyMock, return_value=mock_memory):
@@ -575,7 +621,7 @@ async def test_save_formatted_audio_uses_wav_filename_content_and_metadata(tmp_p
     storage = AzureBlobStorageIO(container_url="https://account.blob.core.windows.net/container")
     mock_container_client = AsyncMock()
     storage._client_async = mock_container_client
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_memory.results_path = "https://account.blob.core.windows.net/container/results"
     mock_memory.results_storage_io = storage
     serializer = data_serializer_factory(category="prompt-memory-entries", data_type="audio_path")
@@ -637,7 +683,7 @@ async def test_save_formatted_audio_writes_azure_wav_via_storage_io(sqlite_insta
 
     mock_storage_io = MagicMock()
     mock_storage_io.write_file_async = AsyncMock(side_effect=_capture_write)
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_memory.results_storage_io = mock_storage_io
 
     serializer = factory(category="prompt-memory-entries", data_type="audio_path")
@@ -674,7 +720,7 @@ async def test_save_formatted_audio_writes_azure_wav_via_storage_io(sqlite_insta
 async def test_get_data_filename_raises_when_results_storage_io_none():
     serializer = data_serializer_factory(category="prompt-memory-entries", data_type="image_path")
     serializer._file_path = None
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_memory.results_storage_io = None
     mock_memory.results_path = "/local/results"
     with patch.object(type(serializer), "_memory", new_callable=PropertyMock, return_value=mock_memory):
@@ -685,7 +731,7 @@ async def test_get_data_filename_raises_when_results_storage_io_none():
 async def test_get_data_filename_uses_db_data_path_when_results_path_falsy():
     serializer = data_serializer_factory(category="prompt-memory-entries", data_type="image_path")
     serializer._file_path = None
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_memory.results_path = None
     mock_storage_io = AsyncMock()
     mock_memory.results_storage_io = mock_storage_io
@@ -704,7 +750,7 @@ async def test_save_formatted_audio_azure_storage_unlinks_local_temp(tmp_path):
     from pyrit.memory.storage import data_serializer_factory as factory
 
     serializer = factory(category="prompt-memory-entries", data_type="audio_path")
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_storage_io = AsyncMock()
     mock_memory.results_storage_io = mock_storage_io
     azure_url = "https://account.blob.core.windows.net/container/audio/test.wav"
@@ -747,7 +793,7 @@ async def test_save_formatted_audio_async_cleans_up_temp_file_on_azure_upload_fa
     """Regression test: temp file must be deleted even when Azure upload fails."""
     serializer = data_serializer_factory(category="prompt-memory-entries", data_type="audio_path")
 
-    mock_memory = MagicMock()
+    mock_memory = MagicMock(spec=MemoryInterface)
     mock_storage_io = AsyncMock()
     mock_storage_io.write_file_async.side_effect = RuntimeError("Azure upload failed")
     mock_memory.results_storage_io = mock_storage_io

@@ -4,12 +4,16 @@
 """Per-execution expectations reach real outcome scorers without becoming attack prompts."""
 
 import asyncio
+from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
 from typing import Any, Literal, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from unit.mocks import MockPromptTarget, store_message
+from aiosqlite import Connection, Cursor
+from sqlalchemy import event
+from unit.async_utils import wait_for_completion_async, wait_for_event_async
+from unit.mocks import MockPromptTarget, store_message_async
 
 from pyrit.exceptions import (
     ComponentRole,
@@ -40,6 +44,7 @@ from pyrit.executor.attack.multi_turn.tree_of_attacks import (
 from pyrit.memory import SQLiteMemory
 from pyrit.models import (
     AttackOutcome,
+    AttackResult,
     AttackSeedGroup,
     ComponentIdentifier,
     Condition,
@@ -71,28 +76,26 @@ class _RecordingScorer(TrueFalseScorer):
     def __init__(
         self,
         *,
-        condition_type: type[Condition] = _OutcomeCondition,
+        condition_type: type[Condition] | None = _OutcomeCondition,
         value: bool = True,
-        barrier: asyncio.Barrier | None = None,
     ) -> None:
         super().__init__()
-        self.condition_type = condition_type
+        self._condition_type = condition_type
         self.value = value
-        self.barrier = barrier
         self.calls: list[tuple[Scorable, ScoringExpectation | None]] = []
         self.contexts: list[ExecutionContext | None] = []
 
-    def matched_conditions(self) -> frozenset[type[Condition]]:
-        return frozenset({self.condition_type})
+    def _get_condition_type(self) -> type[Condition] | None:
+        return self._condition_type
 
     def _build_identifier(self) -> ComponentIdentifier:
-        return self._create_identifier(params={"condition": self.condition_type.__name__, "value": self.value})
+        return self._create_identifier(
+            params={"condition": self.condition_type.__name__ if self.condition_type else None, "value": self.value}
+        )
 
     async def _score_scorable_async(self, *, scorable: Scorable, expectation: ScoringExpectation | None) -> list[Score]:
         self.calls.append((scorable, expectation))
         self.contexts.append(get_execution_context())
-        if self.barrier is not None:
-            await self.barrier.wait()
         return [
             Score(
                 score_value=str(self.value).lower(),
@@ -105,7 +108,7 @@ class _RecordingScorer(TrueFalseScorer):
 
 
 class _RecordingFloatScorer(FloatScaleScorer):
-    MATCHED_CONDITIONS = frozenset({_OutcomeCondition})
+    CONDITION_TYPE = _OutcomeCondition
 
     def __init__(self) -> None:
         super().__init__()
@@ -125,6 +128,10 @@ class _RecordingFloatScorer(FloatScaleScorer):
                 scorable=cast("ScorableUnion", scorable),
             )
         ]
+
+
+class _ConfiguredFloatScorer(_RecordingFloatScorer):
+    CONDITION_TYPE = None
 
 
 def _expectation(objective: str | None = "scoring objective") -> ScoringExpectation:
@@ -203,10 +210,10 @@ class TestExecutionExpectationTransport:
 
         effective = supplied.model_copy(update={"objective": "attack objective"})
         assert result.last_response is not None
-        [stored] = sqlite_instance.get_scores(score_type="true_false")
+        [stored] = await sqlite_instance.get_scores_async(score_type="true_false")
         assert stored.scored_expectation == effective
         assert stored.scorable == MessageScorable(message_piece_ids=(result.last_response.id,))
-        [stored_result] = sqlite_instance.get_attack_results(objective="attack objective")
+        [stored_result] = await sqlite_instance.get_attack_results_async(objective="attack objective")
         assert stored_result.automated_score is not None
         assert stored_result.automated_score.id == stored.id
         assert stored_result.automated_score.scored_expectation == effective
@@ -238,7 +245,7 @@ class TestExecutionExpectationTransport:
         assert result.automated_score.scored_expectation == context.expectation
         assert scorer.calls[0][1] is context.expectation
 
-    async def test_objective_and_auxiliary_receive_full_sibling_criteria_async(self) -> None:
+    async def test_auxiliary_cannot_supply_missing_objective_coverage_async(self) -> None:
         supplied = ScoringExpectation(
             objective="scoring objective",
             conditions=(_OutcomeCondition(value="main criterion"), _AuxiliaryCondition(value="secondary criterion")),
@@ -250,25 +257,44 @@ class TestExecutionExpectationTransport:
             attack_scoring_config=AttackScoringConfig(objective_scorer=objective, auxiliary_scorers=[auxiliary]),
         )
 
-        await attack.execute_async(objective="attack objective", expectation=supplied)
-
-        assert objective.calls[0][1] is supplied
-        assert auxiliary.calls[0][1] is supplied
-        assert objective.calls[0][0] == auxiliary.calls[0][0]
+        with patch.object(attack._objective_target, "send_prompt_async", new_callable=AsyncMock) as send:
+            with pytest.raises(ValueError, match="does not support.*_AuxiliaryCondition"):
+                await attack.execute_async(objective="attack objective", expectation=supplied)
+        assert objective.calls == auxiliary.calls == []
+        send.assert_not_awaited()
 
     @pytest.mark.parametrize("from_seeds", [False, True], ids=["objectives", "seed_groups"])
-    async def test_concurrent_rows_keep_effective_expectations_isolated_async(self, from_seeds: bool) -> None:
+    async def test_concurrent_rows_keep_effective_expectations_isolated_async(
+        self, *, from_seeds: bool, sqlite_instance: SQLiteMemory
+    ) -> None:
         objectives = ["broadcast row", "replaced row", "cleared row", "empty row"]
         supplied = _expectation(None)
         replaced = ScoringExpectation(objective="replacement", conditions=(_OutcomeCondition(value="different"),))
         empty = _expectation("")
         overrides = [{}, {"expectation": replaced}, {"expectation": None}, {"expectation": empty}]
-        scorer = _RecordingScorer(barrier=asyncio.Barrier(4))
+        original = supplied.model_dump()
+        scorer = _RecordingScorer()
+        target = MockPromptTarget()
         attack = PromptSendingAttack(
-            objective_target=MockPromptTarget(), attack_scoring_config=AttackScoringConfig(objective_scorer=scorer)
+            objective_target=target, attack_scoring_config=AttackScoringConfig(objective_scorer=scorer)
         )
+        scoring_started, release_scoring = asyncio.Event(), asyncio.Event()
+        record_score = scorer._score_scorable_async
+
+        async def gated_score_async(*, scorable: Scorable, expectation: ScoringExpectation | None) -> list[Score]:
+            scores = await record_score(scorable=scorable, expectation=expectation)
+            if len(scorer.calls) == 3:
+                scoring_started.set()
+            await release_scoring.wait()
+            return scores
+
         executor = AttackExecutor(max_concurrency=4)
-        kwargs = {"attack": attack, "expectation": supplied, "field_overrides": overrides}
+        kwargs = {
+            "attack": attack,
+            "expectation": supplied,
+            "field_overrides": overrides,
+            "return_partial_on_failure": True,
+        }
         if from_seeds:
             execution = executor.execute_attack_from_seed_groups_async(
                 seed_groups=[AttackSeedGroup(seeds=[SeedObjective(value=value)]) for value in objectives], **kwargs
@@ -276,20 +302,56 @@ class TestExecutionExpectationTransport:
         else:
             execution = executor.execute_attack_async(objectives=objectives, **kwargs)
 
-        batch = await asyncio.wait_for(execution, timeout=10)
+        with patch.object(scorer, "_score_scorable_async", side_effect=gated_score_async):
+            task = asyncio.create_task(execution)
+            try:
+                await wait_for_event_async(event=scoring_started, tasks=[task])
+                assert len(scorer.calls) == 3
+                assert not task.done()
+                release_scoring.set()
+                batch = await wait_for_completion_async(future=task)
+            finally:
+                release_scoring.set()
+                if not task.done():
+                    task.cancel()
+                await wait_for_completion_async(future=asyncio.gather(task, return_exceptions=True))
 
+        valid_objectives = [objectives[0], objectives[1], objectives[3]]
         expected = [
             supplied.model_copy(update={"objective": objectives[0]}),
             replaced,
-            ScoringExpectation(objective=objectives[2]),
             empty,
         ]
-        results = batch.get_results()
-        assert len(results) == 4
-        for result, expectation in zip(results, expected, strict=True):
+        results = batch.completed_results
+        assert len(results) == 3
+        assert batch.input_indices == [0, 1, 3]
+        assert sorted(target.prompt_sent) == sorted(valid_objectives)
+        [(failed_objective, error)] = batch.incomplete_objectives
+        assert failed_objective == objectives[2]
+        assert "requires one _OutcomeCondition" in str(error)
+        stored_scores = {score.id: score for score in await sqlite_instance.get_scores_async(score_type="true_false")}
+        stored_results = {
+            result.attack_result_id: result
+            for result in await sqlite_instance.get_attack_results_async(
+                attack_result_ids=[result.attack_result_id for result in results]
+            )
+        }
+        assert len(stored_scores) == len(stored_results) == 3
+        for result, objective, expectation in zip(results, valid_objectives, expected, strict=True):
+            assert result.objective == objective
+            assert result.last_response is not None
             assert result.automated_score is not None
             assert result.automated_score.scored_expectation == expectation
-        assert supplied.objective is None
+            scorable = MessageScorable(message_piece_ids=(result.last_response.id,))
+            assert (scorable, expectation) in scorer.calls
+            stored_score = stored_scores[result.automated_score.id]
+            assert stored_score.scorable == scorable
+            assert stored_score.scored_expectation == expectation
+            stored_result = stored_results[result.attack_result_id]
+            assert stored_result.automated_score is not None
+            assert stored_result.automated_score.id == stored_score.id
+            assert stored_result.automated_score.scored_expectation == expectation
+        assert supplied.model_dump() == original
 
     async def test_multi_prompt_seed_group_override_reaches_final_score_async(self) -> None:
         target = MockPromptTarget()
@@ -356,7 +418,7 @@ class TestExecutionExpectationTransport:
         with (
             patch.object(attack, "get_attack_scoring_config", return_value=None),
             patch.object(attack, "_setup_async", new_callable=AsyncMock) as setup,
-            pytest.raises(ValueError, match="does not match the condition"),
+            pytest.raises(ValueError, match="objective scorer is required"),
         ):
             await attack.execute_async(objective="attack objective", expectation=_expectation())
         setup.assert_not_awaited()
@@ -437,7 +499,7 @@ class TestExecutionExpectationTransport:
         target = MockPromptTarget()
         objective = _RecordingScorer()
         auxiliary = _RecordingScorer()
-        refusal = _RecordingScorer(value=False)
+        refusal = _RecordingScorer(value=False, condition_type=None)
         supplied = _expectation()
         attack = CrescendoAttack(
             objective_target=target,
@@ -477,7 +539,7 @@ class TestExecutionExpectationTransport:
         assert all("attack objective" in prompt and "scoring objective" not in prompt for prompt in target.prompt_sent)
         assert objective.calls == [(ContentScorable(value="default\ndefault"), supplied)]
         assert auxiliary.calls == objective.calls
-        scores = sqlite_instance.get_scores(score_type="true_false")
+        scores = await sqlite_instance.get_scores_async(score_type="true_false")
         assert len(scores) == 2
         assert all(isinstance(score.scorable, ContentEntryScorable) for score in scores)
         assert all(score.scored_expectation == supplied and score.message_piece_id is None for score in scores)
@@ -497,14 +559,22 @@ class TestExecutionExpectationTransport:
             total_length=4,
             attack_scoring_config=AttackScoringConfig(objective_scorer=objective, auxiliary_scorers=[auxiliary]),
         )
+        if objective_kind == "absent":
+            with pytest.raises(ValueError, match="objective scorer is required"):
+                await attack.execute_async(objective="attack objective", expectation=_expectation())
+            assert not auxiliary.calls
+            return
         with (
             patch.object(objective, "_score_scorable_async", new_callable=AsyncMock, return_value=[])
             if objective_kind == "empty"
             else nullcontext()
         ):
             result = await attack.execute_async(objective="attack objective", expectation=_expectation())
-        assert result.outcome == (AttackOutcome.UNDETERMINED if objective_kind == "absent" else AttackOutcome.FAILURE)
-        if objective_kind != "negative":
+        if objective_kind == "negative":
+            assert result.outcome == AttackOutcome.FAILURE
+        else:
+            # The auxiliary verdict never stands in for a missing objective score.
+            assert result.outcome == AttackOutcome.UNDETERMINED
             assert result.automated_score is None
         assert len(auxiliary.calls) == 1
         [context] = auxiliary.contexts
@@ -559,7 +629,7 @@ class TestExecutionExpectationTransport:
             patch.object(failing, "_score_scorable_async", side_effect=original),
             pytest.raises(RuntimeError, match=f"Strategy execution failed for {failing_role.value}") as raised,
         ):
-            await attack.execute_async(objective="attack objective")
+            await attack.execute_async(objective="attack objective", expectation=_expectation())
 
         context = get_exception_execution_context(raised.value)
         assert context is not None
@@ -570,14 +640,103 @@ class TestExecutionExpectationTransport:
         assert raised.value.__cause__.__cause__ is original
         assert get_execution_context() is None
 
+    async def test_attack_error_persists_after_cancelled_score_validation_async(
+        self, sqlite_instance: SQLiteMemory
+    ) -> None:
+        objective, auxiliary = _RecordingScorer(), _RecordingScorer(value=False)
+        attack = PromptSendingAttack(
+            objective_target=MockPromptTarget(),
+            attack_scoring_config=AttackScoringConfig(objective_scorer=objective, auxiliary_scorers=[auxiliary]),
+        )
+        write_started, validation_started, release_read = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        validation_cancelled, connection_closed = asyncio.Event(), asyncio.Event()
+        persistence_started, release_persistence = asyncio.Event(), asyncio.Event()
+        validation_connection: Connection | None = None
+        original = ValueError("scoring failed")
+
+        def record_write(*args: Any) -> None:
+            if args[2] == "BEGIN IMMEDIATE":
+                write_started.set()
+
+        async def fail_auxiliary_async(**_kwargs: Any) -> list[Score]:
+            await validation_started.wait()
+            raise original
+
+        fetchall, close_connection = Cursor.fetchall, Connection.close
+        persist_results = sqlite_instance.add_attack_results_to_memory_async
+
+        async def delayed_fetchall_async(cursor: Cursor) -> Iterable[Any]:
+            nonlocal validation_connection
+            if write_started.is_set() and not validation_started.is_set():
+                validation_connection = cursor._conn
+                validation_started.set()
+                try:
+                    await release_read.wait()
+                except asyncio.CancelledError:
+                    validation_cancelled.set()
+                    raise
+            return await fetchall(cursor)
+
+        async def observed_connection_close_async(connection: Connection) -> None:
+            await close_connection(connection)
+            if connection is validation_connection:
+                connection_closed.set()
+
+        async def delayed_persistence_async(*, attack_results: Sequence[AttackResult]) -> None:
+            persistence_started.set()
+            await release_persistence.wait()
+            await persist_results(attack_results=attack_results)
+
+        engine = sqlite_instance._get_async_engine()
+        event.listen(engine.sync_engine, "after_cursor_execute", record_write)
+        try:
+            with (
+                patch.object(auxiliary, "_score_scorable_async", side_effect=fail_auxiliary_async),
+                patch.object(Cursor, "fetchall", new=delayed_fetchall_async),
+                patch.object(Connection, "close", new=observed_connection_close_async),
+                patch.object(
+                    sqlite_instance, "add_attack_results_to_memory_async", side_effect=delayed_persistence_async
+                ),
+            ):
+                task = asyncio.create_task(
+                    attack.execute_async(objective="attack objective", expectation=_expectation())
+                )
+                try:
+                    # ERROR persistence follows scorer draining, but is not part of the cleanup budget.
+                    await wait_for_event_async(event=validation_started, tasks=[task])
+                    await wait_for_event_async(event=persistence_started, tasks=[task], timeout=5)
+                    assert validation_cancelled.is_set()
+                    assert connection_closed.is_set()
+                    assert not release_read.is_set()
+                    assert not task.done()
+                    release_persistence.set()
+                    with pytest.raises(RuntimeError, match="Strategy execution failed for auxiliary_scorer") as raised:
+                        await wait_for_completion_async(future=task)
+                finally:
+                    release_read.set()
+                    release_persistence.set()
+                    if not task.done():
+                        task.cancel()
+                    await wait_for_completion_async(future=asyncio.gather(task, return_exceptions=True))
+        finally:
+            event.remove(engine.sync_engine, "after_cursor_execute", record_write)
+
+        assert validation_started.is_set()
+        assert raised.value.__cause__.__cause__ is original
+        [stored] = await sqlite_instance.get_attack_results_async(objective="attack objective")
+        assert stored.outcome == AttackOutcome.ERROR
+        assert stored.error_message is not None
+        assert "scoring failed" in stored.error_message
+        assert await sqlite_instance.get_scores_async(score_type="true_false") == []
+
     @pytest.mark.parametrize("duplicate", [False, True], ids=["initial_node", "duplicated_node"])
     @pytest.mark.parametrize("explicit_expectation", [False, True], ids=["default_objective", "scoring_objective"])
     async def test_tap_node_preserves_execution_expectation_async(
         self, *, duplicate: bool, explicit_expectation: bool
     ) -> None:
         target = MockPromptTarget()
-        leaf = _RecordingFloatScorer()
-        auxiliary = _RecordingScorer()
+        leaf = _RecordingFloatScorer() if explicit_expectation else _ConfiguredFloatScorer()
+        auxiliary = _RecordingScorer(condition_type=_OutcomeCondition if explicit_expectation else None)
         supplied = _expectation() if explicit_expectation else None
         attack = TreeOfAttacksWithPruningAttack(
             objective_target=target,
@@ -597,10 +756,12 @@ class TestExecutionExpectationTransport:
         assert on_topic.call_args.args == ("attack objective",)
         await node.send_prompt_async(objective=context.objective)
         if duplicate:
-            child = node.duplicate()
+            child = await node.duplicate_async()
             response = Message.from_prompt(prompt="branch response", role="assistant")
             response.get_piece().conversation_id = child.objective_target_conversation_id
-            await child._score_response_async(response=store_message(response), objective=context.objective)
+            await child._score_response_async(
+                response=(await store_message_async(response)), objective=context.objective
+            )
             node = child
 
         assert node.objective_score is not None

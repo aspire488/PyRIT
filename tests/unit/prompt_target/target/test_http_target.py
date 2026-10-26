@@ -219,6 +219,18 @@ async def test_send_prompt_async_allows_configured_internal_destination(mock_req
 
 
 @patch("httpx.AsyncClient.request", new_callable=AsyncMock)
+async def test_send_prompt_async_without_callback_stores_decoded_text(mock_request, patch_central_database):
+    target = HTTPTarget(http_request="POST /api HTTP/1.1\nHost: example.com\n\n{PROMPT}")
+    message = Message(message_pieces=[MessagePiece(role="user", original_value="prompt")])
+    body = "Sure \u2014 here\u2019s the answer:\nStep 1: caf\u00e9"
+    mock_request.return_value = httpx.Response(200, content=body.encode("utf-8"))
+
+    response = await target.send_prompt_async(message=message)
+
+    assert response[0].get_value() == body
+
+
+@patch("httpx.AsyncClient.request", new_callable=AsyncMock)
 async def test_send_prompt_async_follows_redirects_when_enabled(mock_request, patch_central_database):
     target = HTTPTarget(
         http_request="POST /api HTTP/1.1\nHost: example.com\n\n",
@@ -334,8 +346,7 @@ async def test_send_prompt_regex_parse_async(mock_request, mock_http_target):
         )
     ]
 
-    mock_response = MagicMock()
-    mock_response.content = b"<html><body>Match: 1234</body></html>"
+    mock_response = httpx.Response(200, content=b"<html><body>Match: 1234</body></html>")
     mock_request.return_value = mock_response
 
     response = await mock_http_target.send_prompt_async(message=message)
@@ -531,3 +542,45 @@ def test_http_target_init_with_client_only():
     )
     assert target._client is client
     assert target.httpx_client_kwargs == {}
+
+
+def test_parse_raw_http_request_strips_transfer_encoding_and_content_length(patch_central_database):
+    request = (
+        "POST / HTTP/1.1\n"
+        "Host: example.com\n"
+        "Content-Type: application/json\n"
+        "Transfer-Encoding: chunked\n"
+        "Content-Length: 100\n\n"
+        '{"test": "val"}'
+    )
+    target = HTTPTarget(http_request=request)
+    headers, body, _, _, _ = target.parse_raw_http_request(request)
+
+    assert headers == {"host": "example.com", "content-type": "application/json"}
+    assert "transfer-encoding" not in headers
+    assert "content-length" not in headers
+    assert body == '{"test": "val"}'
+
+
+async def test_send_prompt_async_strips_transfer_encoding_and_sends_intact_multibyte_body(patch_central_database):
+    captured_requests: list[httpx.Request] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(200, text="ok")
+
+    raw_request = "POST / HTTP/1.1\nHost: example.com\nTransfer-Encoding: chunked\nContent-Length: 5\n\n{PROMPT}"
+    target = HTTPTarget(http_request=raw_request, transport=httpx.MockTransport(handle_request))
+    message = Message.from_prompt(prompt="你好世界", role="user")
+
+    response = await target.send_prompt_async(message=message)
+
+    assert len(response) == 1
+    assert response[0].get_value() == "ok"
+    assert len(captured_requests) == 1
+
+    req = captured_requests[0]
+    assert "transfer-encoding" not in req.headers
+    # Verify httpx computed the accurate UTF-8 byte length on the wire (12 bytes for "你好世界")
+    assert req.headers.get("content-length") == "12"
+    assert req.content == "你好世界".encode()

@@ -1,31 +1,51 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
+import { useState, useCallback, useEffect, useRef, useMemo, useTransition } from 'react'
 import { Routes, Route, Navigate, useNavigate, useLocation, useParams, useSearchParams, matchPath } from 'react-router'
 import { useMsal } from '@azure/msal-react'
+import { Button, MessageBar, MessageBarBody, Spinner } from '@fluentui/react-components'
 import { Joyride } from 'react-joyride'
-import { useTheme } from './hooks/useTheme'
+import { ThemeProvider, useTheme } from './hooks/useTheme'
+import { UserPreferencesProvider, useUserPreferences } from './hooks/useUserPreferences'
+import { RuntimeBanner, RuntimeProvider, useRuntime } from '@/hooks/useRuntime'
 import MainLayout from './components/Layout/MainLayout'
 import ChatWindow from './components/Chat/ChatWindow'
 import AttackNotFound from './components/Chat/AttackNotFound'
 import Home from './components/Home/Home'
 import TargetConfig from './components/Config/TargetConfig'
 import ConverterRegistry from './components/Registry/ConverterRegistry'
+import TechniqueRegistry from './components/Registry/TechniqueRegistry'
 import RegistryLayout from './components/Registry/RegistryLayout'
+import ScorerRegistry from './components/Registry/ScorerRegistry'
+import { useScorerRegistry } from './hooks/useScorerRegistry'
+import type { RegisteredComponentReference, ManualContinuation } from './types'
 import Configuration from './components/Configuration/Configuration'
 import AttackHistory from './components/History/AttackHistory'
+import AnalyticsPage from './components/Analytics/AnalyticsPage'
 import HistoryPage from './components/History/HistoryPage'
+import OperationDetailPage from './components/Operations/OperationDetailPage'
+import OperationsPage from './components/Operations/OperationsPage'
 import type { HistoryTab } from './components/History/HistoryPage'
 import ScenarioHistory from './components/History/ScenarioHistory'
 import ScenarioCatalog from './components/Scenarios/ScenarioCatalog'
 import ScenarioDetail from './components/Scenarios/ScenarioDetail'
 import ScenarioRunPage from './components/Scenarios/ScenarioRunPage'
+import ScenarioPresetEditor from './components/ScenarioPresets/ScenarioPresetEditor'
+import ScenarioPresetLibrary from './components/ScenarioPresets/ScenarioPresetLibrary'
+import { presetEditorRoutePath } from './components/ScenarioPresets/presetRoutes'
+import ScenarioSuiteEditor from './components/ScenarioSuites/ScenarioSuiteEditor'
+import ScenarioSuiteLibrary from './components/ScenarioSuites/ScenarioSuiteLibrary'
+import DatasetCatalog from './components/Datasets/DatasetCatalog'
+import DatasetSelection from './components/Datasets/DatasetSelection'
 import FeedbackDialog from './components/Feedback/FeedbackDialog'
 import type { HistoryFilters } from './components/History/historyFilters'
 import { ConnectionBanner } from './components/ConnectionBanner'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { useAttackTargetResolution } from './hooks/useAttackTargetResolution'
+import { useAuthConfig } from './auth/AuthConfigContext'
+import { useTargetPreferences } from './hooks/useTargetPreferences'
+import { useTargetRegistry } from './hooks/useTargetRegistry'
+import { useOperationSelection } from './hooks/useOperationSelection'
 import { ConnectionHealthProvider, useConnectionHealth } from './hooks/useConnectionHealth'
 import { DEFAULT_GLOBAL_LABELS } from './components/Labels/labelDefaults'
-import { readStoredGlobalLabels, persistGlobalLabels } from './components/Labels/labelStorage'
 import { filtersFromSearchParams, filtersToSearchParams } from './components/History/historyFilters'
 import {
   scenarioHistoryFiltersFromSearchParams,
@@ -33,8 +53,13 @@ import {
 } from './components/History/scenarioHistoryFilters'
 import type { ScenarioHistoryFilters } from './components/History/scenarioHistoryFilters'
 import type { ViewName } from './components/Sidebar/Navigation'
-import type { AttackOutcome, AttackSummary, BackendScore, TargetInfo } from './types'
+import type {
+  AttackOutcome, AttackSummary, BackendScore, Operation, TargetInfo, TargetInstance, TargetPreferences, TargetReference,
+  UserPreferences,
+} from './types'
 import {
+  resolveTargetReference,
+  targetReference,
   targetEndpoint,
   targetIdentifierHash,
   targetModelName,
@@ -46,8 +71,11 @@ import { useTour } from './hooks/useTour'
 import {
   attackConversationRoutePath,
   attackRoutePath,
+  DATASET_DETAIL_PATH,
+  DATASETS_PATH,
   routerPathParamValue,
   scenarioRunProvenance,
+  findingEvidenceOrigin,
   scenarioRunRoutePath,
 } from './utils/routeParams'
 
@@ -60,8 +88,11 @@ const VIEW_PATHS: Record<ViewName, string> = {
   home: '/',
   chat: '/chat',
   history: HISTORY_ATTACKS_PATH,
+  analytics: '/analytics',
+  operations: '/operations',
   registry: '/registry/targets',
   scenarios: '/scanner',
+  datasets: DATASETS_PATH,
   configuration: '/config',
 }
 
@@ -78,11 +109,20 @@ function viewFromPath(pathname: string): ViewName {
   if (pathname === '/targets' || pathname.startsWith('/registry')) {
     return 'registry'
   }
+  if (pathname.startsWith(`${VIEW_PATHS.operations}/`)) {
+    return 'operations'
+  }
   if (
     pathname === VIEW_PATHS.scenarios
     || pathname.startsWith(`${VIEW_PATHS.scenarios}/`)
   ) {
     return 'scenarios'
+  }
+  if (
+    pathname === VIEW_PATHS.datasets
+    || pathname.startsWith(`${VIEW_PATHS.datasets}/`)
+  ) {
+    return 'datasets'
   }
   const match = (Object.entries(VIEW_PATHS) as [ViewName, string][]).find(
     ([, path]) => path === pathname,
@@ -93,6 +133,11 @@ function viewFromPath(pathname: string): ViewName {
 function LegacyScenarioRunRedirect() {
   const { scenarioResultId } = useParams<{ scenarioResultId: string }>()
   return <Navigate replace to={scenarioRunRoutePath(routerPathParamValue(scenarioResultId))} />
+}
+
+function LegacyPresetEditorRedirect() {
+  const { presetName } = useParams<{ presetName: string }>()
+  return <Navigate replace to={presetEditorRoutePath(routerPathParamValue(presetName))} />
 }
 
 function LegacyScenarioHistoryRedirect() {
@@ -112,18 +157,34 @@ type AttackLoadStatus = 'loading' | 'success' | 'not-found' | 'error'
 interface LoadedAttack {
   id: string
   loadSequence: number
-  targetSource: 'persisted' | 'active-selection'
+  targetSource: 'persisted' | 'created'
+  targetGeneration?: string
   mainConversationId: string | null
   labels: Record<string, string> | null
   operator: string | null
   target: TargetInfo | null
+  targetUnbound?: boolean
+  createdTarget?: TargetInstance
   relatedConversationIds: string[]
   objective: string
   outcome: NonNullable<AttackSummary['outcome']>
   automatedScore: BackendScore | null
   humanScore: BackendScore | null
+  chatScorer?: RegisteredComponentReference | null
+  chatScorerInherited?: boolean
+  executionReadOnly?: boolean
+  manualContinuation?: ManualContinuation | null
   lastResponseMessagePieceId: string | null
   status: AttackLoadStatus
+}
+
+interface ServerDefaults {
+  generation: string
+  revision: number
+  labels: Record<string, string>
+  /** A configured Operation name to propose; it is never resolved to a saved Operation automatically. */
+  operation: string | null
+  error: string | null
 }
 
 function ConnectionBannerContainer() {
@@ -148,10 +209,33 @@ function ConnectionBannerContainer() {
   return <ConnectionBanner status={status} />
 }
 
-function App() {
-  const { instance } = useMsal()
+function AppContent({ operatorAlias }: { operatorAlias: string | null }) {
+  const { generation, ready } = useRuntime()
   const navigate = useNavigate()
+  const [isNavigatingToCreatedAttack, startCreatedAttackTransition] = useTransition()
   const location = useLocation()
+  const registry = useTargetRegistry()
+  const scorerRegistry = useScorerRegistry()
+  const { preferences, updatePreferences, error: preferenceError } = useUserPreferences()
+  const targetDefaults = useTargetPreferences(registry.targets)
+  const [draftSession, setDraftSession] = useState<{
+    pathname: string
+    key: number
+    target: TargetReference | null
+  }>({ pathname: location.pathname, key: 0, target: targetDefaults.preferences.objective })
+  if (draftSession.pathname !== location.pathname) {
+    setDraftSession({
+      pathname: location.pathname,
+      key: draftSession.key + (location.pathname === VIEW_PATHS.chat ? 1 : 0),
+      target: targetDefaults.preferences.objective,
+    })
+  }
+  const draftTarget = !registry.loading && !registry.error && draftSession.target
+    ? resolveTargetReference(draftSession.target, registry.targets) : null
+  const setDefaultTarget = (role: keyof TargetPreferences, target: TargetInstance | null): void => {
+    if (target) registry.rememberTarget(target)
+    targetDefaults.setDefault(role, target)
+  }
 
   // The URL is the source of truth for which attack/conversation is open.
   const conversationMatch = matchPath(
@@ -177,29 +261,54 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [generation])
 
-  // Read once, before the effect below can overwrite what the user picked.
-  const [storedLabels] = useState(readStoredGlobalLabels)
-  const [globalLabels, setGlobalLabels] = useState<Record<string, string>>(
-    () => ({ ...DEFAULT_GLOBAL_LABELS, ...storedLabels }),
-  )
+  const [serverDefaults, setServerDefaults] = useState<ServerDefaults | null>(null)
+  const [defaultsRevision, setDefaultsRevision] = useState(0)
+  const defaultLabels = serverDefaults?.labels ?? DEFAULT_GLOBAL_LABELS
+  const defaultsCurrent = serverDefaults !== null
+    && serverDefaults.generation === generation
+    && serverDefaults.revision === defaultsRevision
+  const defaultsError = defaultsCurrent ? serverDefaults.error : null
+  const defaultsReady = defaultsCurrent && !defaultsError
+  const globalLabels = useMemo<Record<string, string>>(() => Object.fromEntries(
+    Object.entries({
+      ...defaultLabels,
+      ...preferences.labels,
+      ...(operatorAlias ? { operator: operatorAlias } : {}),
+    }).filter((entry): entry is [string, string] => entry[1] !== null),
+  ), [defaultLabels, preferences.labels, operatorAlias])
 
-  // What the app would show if the user had never touched anything: the
-  // built-in placeholders, then whatever the backend hands out. Only labels
-  // that differ from this are the user's own, and only those are worth
-  // keeping — otherwise a value that merely came from the config gets stored
-  // as a choice and outranks that same config from then on.
-  const unchosenLabels = useRef<Record<string, string>>({ ...DEFAULT_GLOBAL_LABELS })
+  const operationSelection = preferences.operation !== undefined ? preferences.operation
+    : defaultsCurrent && serverDefaults?.operation ? { name: serverDefaults.operation } : null
+  const operation = useOperationSelection(operationSelection, generation)
+  const operationReady = operation.state.status === 'empty' || operation.state.status === 'resolved'
+  const operationId = operation.state.status === 'resolved' ? operation.state.operation.id : null
+  const newActivityReady = defaultsReady && operationReady
+  const operationBlockedReason = defaultsReady && !operationReady && operation.state.status !== 'loading'
+    ? 'Choose a saved Operation, register, or clear this one to start new attacks and scans.'
+    : undefined
+  const { remember: rememberOperation } = operation
+  const handleOperationChange = useCallback((selected: Operation | null) => {
+    if (selected) rememberOperation(selected)
+    updatePreferences((current: UserPreferences) => ({ ...current, operation: selected ? { id: selected.id } : null }))
+  }, [rememberOperation, updatePreferences])
 
   const handleGlobalLabelsChange = useCallback((labels: Record<string, string>) => {
-    setGlobalLabels(labels)
-    persistGlobalLabels(
-      Object.fromEntries(
-        Object.entries(labels).filter(([key, value]) => value !== unchosenLabels.current[key]),
-      ),
-    )
-  }, [])
+    const changedKeys = Object.keys({ ...globalLabels, ...labels })
+      .filter((key: string) => !(operatorAlias && key === 'operator') && labels[key] !== globalLabels[key])
+    updatePreferences((current: UserPreferences) => {
+      const overrides = { ...current.labels }
+      for (const key of changedKeys) {
+        if (labels[key] === defaultLabels[key]) {
+          delete overrides[key]
+        } else {
+          overrides[key] = labels[key] ?? null
+        }
+      }
+      return { ...current, labels: overrides }
+    })
+  }, [defaultLabels, globalLabels, operatorAlias, updatePreferences])
 
   // History filters live in the URL query string so they are shareable and
   // survive refresh. The breadcrumb ref remembers the last /history query so
@@ -214,8 +323,13 @@ function App() {
     () => scenarioRunProvenance(searchParams),
     [searchParams],
   )
+  const findingEvidenceId = useMemo(
+    () => findingEvidenceOrigin(searchParams),
+    [searchParams],
+  )
   const lastHistorySearch = useRef('')
   const lastScenarioHistorySearch = useRef('')
+  const lastAnalyticsLocation = useRef('')
   useEffect(() => {
     if (location.pathname === HISTORY_ATTACKS_PATH) {
       lastHistorySearch.current = location.search
@@ -223,10 +337,14 @@ function App() {
     if (location.pathname === HISTORY_SCANNER_PATH) {
       lastScenarioHistorySearch.current = location.search
     }
-  }, [location.pathname, location.search])
+    if (location.pathname === VIEW_PATHS.analytics) {
+      lastAnalyticsLocation.current = location.search + location.hash
+    }
+  }, [location.pathname, location.search, location.hash])
 
   const handleFiltersChange = useCallback((filters: HistoryFilters) => {
-    setSearchParams(filtersToSearchParams(filters), { replace: true })
+    // The label search is controlled by this URL state and must not lag behind typing.
+    setSearchParams(filtersToSearchParams(filters), { replace: true, flushSync: true })
   }, [setSearchParams])
 
   const handleScenarioHistoryFiltersChange = useCallback((filters: ScenarioHistoryFilters) => {
@@ -236,8 +354,14 @@ function App() {
   const handleHistoryTabChange = useCallback((tab: HistoryTab) => {
     const path = tab === 'attacks' ? HISTORY_ATTACKS_PATH : HISTORY_SCANNER_PATH
     const search = tab === 'attacks' ? lastHistorySearch.current : lastScenarioHistorySearch.current
-    navigate(path + search)
-  }, [navigate])
+    const params = new URLSearchParams(search)
+    params.delete('operation_id')
+    for (const operationId of searchParams.getAll('operation_id')) {
+      params.append('operation_id', operationId)
+    }
+    const query = params.toString()
+    navigate(path + (query ? `?${query}` : ''))
+  }, [navigate, searchParams])
 
   /** App version display, attached to feedback context */
   const [appVersion, setAppVersion] = useState<string>('')
@@ -253,65 +377,46 @@ function App() {
   // The attack whose deep-linked conversation id we have already validated.
   const validatedConversationForAttack = useRef<string | null>(null)
 
-  // Fetch default labels from backend, then override operator with active account if available
+  // User choices remain separate, so a late response cannot replace an edit.
   useEffect(() => {
+    if (!ready) return
     let ignore = false
 
-    async function initLabels() {
-      let defaultLabels: Record<string, string> = {}
+    async function initLabels(): Promise<void> {
       try {
         const data = await versionApi.getVersion()
-        if (data.default_labels && Object.keys(data.default_labels).length > 0) {
-          defaultLabels = data.default_labels
-        }
+        if (ignore) return
+        setServerDefaults({
+          generation,
+          revision: defaultsRevision,
+          labels: { ...DEFAULT_GLOBAL_LABELS, ...data.default_labels },
+          operation: data.default_operation ?? null,
+          error: null,
+        })
         if (data.display || data.version) {
-          if (!ignore) setAppVersion(data.display ?? data.version ?? '')
+          setAppVersion(data.display ?? data.version ?? '')
         }
-      } catch {
-        /* version fetch handled elsewhere */
+      } catch (error: unknown) {
+        if (ignore) return
+        setServerDefaults((previous) => ({
+          generation,
+          revision: defaultsRevision,
+          labels: previous?.labels ?? DEFAULT_GLOBAL_LABELS,
+          operation: previous?.operation ?? null,
+          error: toApiError(error).detail,
+        }))
       }
-
-      if (ignore) return
-
-      const account = instance.getActiveAccount?.()
-      const alias = account?.username ? account.username.split('@')[0].toLowerCase() : null
-
-      unchosenLabels.current = {
-        ...DEFAULT_GLOBAL_LABELS,
-        ...defaultLabels,
-        ...(alias ? { operator: alias } : {}),
-      }
-
-      setGlobalLabels(prev => {
-        const next = { ...prev }
-        for (const [key, value] of Object.entries(defaultLabels)) {
-          // These defaults only fill in what you have not chosen. `prev`
-          // already carries what was stored and anything picked while this
-          // request was in flight, so neither gets overwritten by a late
-          // response.
-          const untouched = prev[key] === DEFAULT_GLOBAL_LABELS[key]
-          if (!(key in storedLabels) && untouched) {
-            next[key] = value
-          }
-        }
-        // The signed-in account still decides who the operator is.
-        if (alias) {
-          next.operator = alias
-        }
-        return next
-      })
     }
 
-    initLabels()
+    void initLabels()
     return () => { ignore = true }
-  }, [instance, storedLabels])
+  }, [generation, ready, defaultsRevision])
 
   // Hydrate loadedAttack from the routed attack id. Depends on routeAttackId
   // ONLY, so switching conversations within an attack never refetches.
   useEffect(() => {
     if (!routeAttackId) {
       // Intentional cleanup of async-sourced state, not a derivable render value.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setLoadedAttack(null)
       validatedConversationForAttack.current = null
       return
@@ -351,6 +456,7 @@ function App() {
           labels: attack.labels ?? {},
           operator: attack.operator ?? null,
           target: attack.target ?? null,
+          targetUnbound: attack.target_unbound === true,
           relatedConversationIds: attack.related_conversations
             ? attack.related_conversations
                 .filter((reference) => reference.conversation_type === 'pruned')
@@ -360,6 +466,10 @@ function App() {
           outcome: attack.outcome ?? 'undetermined',
           automatedScore: attack.automated_score ?? null,
           humanScore: attack.human_score ?? null,
+          chatScorer: attack.chat_scorer ?? null,
+          chatScorerInherited: attack.chat_scorer_inherited ?? false,
+          executionReadOnly: attack.execution_read_only ?? false,
+          manualContinuation: attack.manual_continuation ?? null,
           lastResponseMessagePieceId: attack.last_response?.id ?? null,
           status: 'success',
         })
@@ -398,10 +508,18 @@ function App() {
   const readyAttack = attackForRoute?.status === 'success' ? attackForRoute : null
   const isAttackNotFound = attackForRoute?.status === 'not-found'
   const isAttackError = attackForRoute?.status === 'error'
-  const isLoadingAttack = routeAttackId !== null && !readyAttack && !isAttackNotFound && !isAttackError
+  const isEvidenceConversationMissing = useMemo(
+    () => Boolean(
+      findingEvidenceId && readyAttack && routeConversationId
+      && routeConversationId !== readyAttack.mainConversationId
+      && !readyAttack.relatedConversationIds.includes(routeConversationId),
+    ),
+    [findingEvidenceId, readyAttack, routeConversationId],
+  )
+  const isLoadingAttack = isNavigatingToCreatedAttack
+    || (routeAttackId !== null && !readyAttack && !isAttackNotFound && !isAttackError)
   const {
-    activeTarget,
-    setExplicitTarget: handleSetActiveTarget,
+    activeTarget: resolvedChatTarget,
     resolutionStatus: targetResolutionStatus,
     retryResolution: retryTargetResolution,
   } = useAttackTargetResolution({
@@ -409,7 +527,17 @@ function App() {
     attackLoadSequence: readyAttack?.loadSequence ?? 0,
     attackTarget: readyAttack?.target ?? null,
     attackTargetSource: readyAttack?.targetSource ?? 'persisted',
+    createdTarget: readyAttack?.createdTarget,
+    targetUnbound: readyAttack?.targetUnbound,
+    createdTargetGeneration: readyAttack?.targetGeneration,
   })
+  const [unboundTarget, setUnboundTarget] = useState<{ attackId: string; target: TargetReference | null } | null>(null)
+  const selectedUnboundTarget = !registry.loading && !registry.error
+    && unboundTarget?.attackId === routeAttackId && unboundTarget?.target
+    ? resolveTargetReference(unboundTarget.target, registry.targets) : null
+  const activeTarget = targetResolutionStatus === 'unbound'
+    ? selectedUnboundTarget
+    : routeAttackId ? resolvedChatTarget : draftTarget
   const activeConversationId = readyAttack
     ? routeConversationId ?? readyAttack.mainConversationId
     : null
@@ -425,16 +553,20 @@ function App() {
       const isKnown =
         routeConversationId === readyAttack.mainConversationId ||
         readyAttack.relatedConversationIds.includes(routeConversationId)
-      if (!isKnown) {
+      if (!isKnown && !findingEvidenceId) {
         navigate(attackRoutePath(readyAttack.id, scenarioResultId), { replace: true })
       }
     }
-  }, [readyAttack, routeConversationId, navigate, scenarioResultId])
+  }, [readyAttack, routeConversationId, navigate, scenarioResultId, findingEvidenceId])
 
   const handleNavigate = useCallback((view: ViewName) => {
     // Re-attach the last filter query so returning to history restores filters.
     if (view === 'history') {
       navigate(VIEW_PATHS.history + lastHistorySearch.current)
+      return
+    }
+    if (view === 'analytics') {
+      navigate(VIEW_PATHS.analytics + lastAnalyticsLocation.current)
       return
     }
     navigate(VIEW_PATHS[view])
@@ -444,21 +576,23 @@ function App() {
     navigate(VIEW_PATHS.chat)
   }, [navigate])
 
-  const handleConversationCreated = useCallback((arId: string, convId: string, objective?: string) => {
+  const handleConversationCreated = useCallback((
+    arId: string,
+    convId: string,
+    objective?: string,
+    selectedTarget?: TargetInstance | null,
+  ) => {
     // Seed the freshly-created attack synchronously and tell the loader to skip
     // its next fetch for this id, so the attack opens without a redundant load.
-    if (activeTarget) {
-      // The target that created or branched this attack is now an explicit
-      // selection for the new attack; a later reload will revalidate it.
-      handleSetActiveTarget(activeTarget)
-    }
-    const target: TargetInfo | null = activeTarget
+    const createdTarget = selectedTarget === undefined ? activeTarget : selectedTarget
+    const target: TargetInfo | null = createdTarget
       ? {
-          target_type: targetType(activeTarget),
-          target_registry_name: activeTarget.target_registry_name,
-          endpoint: targetEndpoint(activeTarget),
-          model_name: targetModelName(activeTarget),
-          identifier_hash: targetIdentifierHash(activeTarget),
+          target_type: targetType(createdTarget),
+          target_registry_name: createdTarget.target_registry_name,
+          endpoint: targetEndpoint(createdTarget),
+          model_name: targetModelName(createdTarget),
+          identifier_hash: targetIdentifierHash(createdTarget),
+          binding: createdTarget.binding,
         }
       : null
     skipNextLoadForAttackId.current = arId
@@ -467,12 +601,15 @@ function App() {
     setLoadedAttack({
       id: arId,
       loadSequence,
-      targetSource: 'active-selection',
+      targetSource: 'created',
+      targetGeneration: generation,
       mainConversationId: convId,
       // New attack uses the current user's labels, so it is never operator-locked.
       labels: null,
       operator: null,
       target,
+      targetUnbound: createdTarget === null,
+      createdTarget: createdTarget ?? undefined,
       relatedConversationIds: [],
       objective: objective ?? '',
       outcome: 'undetermined',
@@ -481,28 +618,41 @@ function App() {
       lastResponseMessagePieceId: null,
       status: 'success',
     })
-    // Replace when promoting an empty /chat to its attack url (first message);
+    // Replace when promoting an empty /chat to its conversation URL (first message);
     // push when branching from an existing attack so Back returns to the source.
-    navigate(attackRoutePath(arId), { replace: routeAttackId === null })
-  }, [activeTarget, handleSetActiveTarget, routeAttackId, navigate])
+    // Keep sends blocked until the new route exposes the created attack's identity.
+    startCreatedAttackTransition(() => {
+      navigate(attackConversationRoutePath(arId, convId), { replace: routeAttackId === null })
+    })
+  }, [activeTarget, generation, routeAttackId, navigate, startCreatedAttackTransition])
 
   const handleObjectiveChange = useCallback((objective: string) => {
     setLoadedAttack((current) => current ? { ...current, objective } : current)
   }, [])
 
   const handleHumanScoreChange = useCallback((humanScore: BackendScore | null, outcome: AttackOutcome) => {
-    setLoadedAttack((current) => current ? { ...current, humanScore, outcome } : current)
-  }, [])
+    setLoadedAttack((current) => current?.id === routeAttackId ? { ...current, humanScore, outcome } : current)
+  }, [routeAttackId])
 
   const handleAttackChange = useCallback((attack: AttackSummary) => {
     setLoadedAttack((current) => (
       current && current.id === attack.attack_result_id
         ? {
             ...current,
+            target: attack.target ?? null,
+            targetUnbound: attack.target_unbound === true,
+            targetSource: 'persisted',
+            relatedConversationIds: (attack.related_conversations ?? [])
+              .filter((reference) => reference.conversation_type === 'pruned')
+              .map((reference) => reference.conversation_id),
             objective: attack.objective ?? '',
             outcome: attack.outcome ?? 'undetermined',
             automatedScore: attack.automated_score ?? null,
             humanScore: attack.human_score ?? null,
+            chatScorer: attack.chat_scorer ?? null,
+            chatScorerInherited: attack.chat_scorer_inherited ?? false,
+            executionReadOnly: attack.execution_read_only ?? false,
+            manualContinuation: attack.manual_continuation ?? null,
             lastResponseMessagePieceId: attack.last_response?.id ?? null,
           }
         : current
@@ -527,18 +677,31 @@ function App() {
     })
   }, [location.search, navigate])
 
-  const chatElement = isAttackNotFound || isAttackError ? (
+  const chatElement = isAttackNotFound || isAttackError || isEvidenceConversationMissing ? (
     <AttackNotFound
       attackId={routeAttackId ?? ''}
       variant={isAttackError ? 'error' : 'not-found'}
+      findingEvidenceId={findingEvidenceId}
       onStartNew={() => navigate(VIEW_PATHS.chat)}
       onBackToHistory={() => navigate(VIEW_PATHS.history)}
     />
   ) : (
     <ChatWindow
+      key={draftSession.key}
       toolbarContainer={chatToolbarContainer}
       onNewAttack={handleNewAttack}
       activeTarget={activeTarget}
+      availableTargets={registry.targets}
+      targetsLoading={registry.loading}
+      targetsError={registry.error}
+      onRefreshTargets={registry.refresh}
+      onSelectTarget={(target: TargetInstance | null) => {
+        if (readyAttack?.targetUnbound) {
+          setUnboundTarget({ attackId: readyAttack.id, target: target ? targetReference(target) : null })
+        }
+        else setDraftSession((current) => ({ ...current, target: target ? targetReference(target) : null }))
+      }}
+      defaultBranchTarget={targetDefaults.objectiveTarget}
       attackResultId={readyAttack ? readyAttack.id : null}
       conversationId={readyAttack ? readyAttack.mainConversationId : null}
       activeConversationId={activeConversationId}
@@ -548,6 +711,9 @@ function App() {
       onHumanScoreChange={handleHumanScoreChange}
       onAttackChange={handleAttackChange}
       labels={globalLabels}
+      operationId={operationId}
+      defaultsReady={newActivityReady}
+      newActivityBlockedReason={operationBlockedReason}
       onNavigate={handleNavigate}
       attackOperator={readyAttack ? readyAttack.operator : null}
       attackTarget={readyAttack ? readyAttack.target : null}
@@ -559,8 +725,17 @@ function App() {
       outcome={readyAttack?.outcome}
       automatedScore={readyAttack?.automatedScore}
       humanScore={readyAttack?.humanScore}
+      chatScorer={readyAttack?.chatScorer}
+      chatScorerInherited={readyAttack?.chatScorerInherited}
+      executionReadOnly={readyAttack?.executionReadOnly}
+      manualContinuation={readyAttack?.manualContinuation}
+      defaultChatScorer={preferences.chatScorer ?? null}
+      availableScorers={scorerRegistry.scorers}
+      scorersLoading={scorerRegistry.loading}
+      scorersError={scorerRegistry.error}
       lastResponseMessagePieceId={readyAttack?.lastResponseMessagePieceId}
       scenarioResultId={readyAttack ? scenarioResultId : null}
+      findingEvidenceId={findingEvidenceId}
     />
   )
 
@@ -571,7 +746,8 @@ function App() {
     handleNavigate,
     resolved === 'dark',
     currentView,
-    activeTarget !== null,
+    targetDefaults.objectiveTarget !== null,
+    canManageConfiguration,
   )
 
   return (
@@ -587,14 +763,59 @@ function App() {
             onStartTour={startTour}
             labels={globalLabels}
             onLabelsChange={handleGlobalLabelsChange}
+            operation={operation.state}
+            onOperationChange={handleOperationChange}
+            onRetryOperation={operation.retry}
+            operatorReadOnly={Boolean(operatorAlias)}
             toolbarRef={setChatToolbarContainer}
           >
+            {ready && !defaultsReady && (
+              <MessageBar intent={defaultsError ? 'error' : 'info'}>
+                <MessageBarBody>
+                  {defaultsError
+                    ? `Could not load default labels. ${defaultsError}`
+                    : 'Loading default labels.'}
+                  {' '}New attacks and scans are unavailable until default labels are loaded.
+                  {defaultsError && (
+                    <Button onClick={() => setDefaultsRevision((revision: number) => revision + 1)}>
+                      Retry default labels
+                    </Button>
+                  )}
+                </MessageBarBody>
+              </MessageBar>
+            )}
+            {operationBlockedReason && (
+              <MessageBar intent="warning">
+                <MessageBarBody>{operationBlockedReason}</MessageBarBody>
+              </MessageBar>
+            )}
+            {preferenceError && (
+              <MessageBar intent="warning">
+                <MessageBarBody>{preferenceError}</MessageBarBody>
+              </MessageBar>
+            )}
+            {!registry.loading && !registry.error && (
+              (['objective', 'adversarial'] as const).map((role) => (
+                targetDefaults.preferences[role]
+                && !(role === 'objective' ? targetDefaults.objectiveTarget : targetDefaults.adversarialTarget)
+                ? (
+                  <MessageBar key={role} intent="warning">
+                    <MessageBarBody>
+                      The saved default {role} target is unavailable or has changed. Select a new default in the registry.
+                      <Button appearance="subtle" onClick={() => setDefaultTarget(role, null)}>
+                        Clear {role} default
+                      </Button>
+                    </MessageBarBody>
+                  </MessageBar>
+                ) : null
+              ))
+            )}
             <Routes>
               <Route
                 path="/"
                 element={
                   <Home
-                    activeTarget={activeTarget}
+                    activeTarget={targetDefaults.objectiveTarget}
                     onNavigate={handleNavigate}
                     onOpenAttack={handleOpenAttack}
                   />
@@ -618,21 +839,61 @@ function App() {
                   path="targets"
                   element={
                     <TargetConfig
-                      activeTarget={activeTarget}
-                      onSetActiveTarget={handleSetActiveTarget}
+                      defaultObjectiveTarget={targetDefaults.objectiveTarget}
+                      defaultAdversarialTarget={targetDefaults.adversarialTarget}
+                      onSetDefaultObjectiveTarget={(target: TargetInstance | null) => setDefaultTarget('objective', target)}
+                      onSetDefaultAdversarialTarget={(target: TargetInstance | null) => setDefaultTarget('adversarial', target)}
+                      onTargetsLoaded={registry.synchronizeTargets}
                     />
                   }
                 />
                 <Route path="converters" element={<ConverterRegistry />} />
+                <Route path="scorers" element={<ScorerRegistry scorers={scorerRegistry.scorers}
+                  loading={scorerRegistry.loading} error={scorerRegistry.error} onRefresh={scorerRegistry.refresh} />} />
+                <Route path="techniques" element={<TechniqueRegistry />} />
+                <Route
+                  path="scenario-presets"
+                  element={
+                    <ScenarioPresetLibrary
+                      targets={registry.targets}
+                      defaultObjectiveTarget={targetDefaults.objectiveTarget}
+                      defaultAdversarialTarget={targetDefaults.adversarialTarget}
+                      labels={globalLabels}
+                      operationId={operationId}
+                      defaultsReady={newActivityReady}
+                    />
+                  }
+                />
+                <Route path="scenario-presets/new" element={<ScenarioPresetEditor mode="create" />} />
+                <Route path="scenario-presets/:presetName/edit" element={<ScenarioPresetEditor mode="edit" />} />
+                <Route path="scenario-suites" element={<ScenarioSuiteLibrary />} />
+                <Route path="scenario-suites/new" element={<ScenarioSuiteEditor mode="create" />} />
+                <Route path="scenario-suites/:suiteName/edit" element={<ScenarioSuiteEditor mode="edit" />} />
               </Route>
               <Route path="/targets" element={<Navigate to="/registry/targets" replace />} />
               <Route path="/scanner" element={<ScenarioCatalog />} />
+              <Route path={DATASETS_PATH} element={<DatasetCatalog />} />
+              <Route path={DATASET_DETAIL_PATH} element={<DatasetSelection />} />
+              <Route path="/scanner/presets" element={<Navigate to="/registry/scenario-presets" replace />} />
+              <Route path="/scanner/presets/new" element={<Navigate to="/registry/scenario-presets/new" replace />} />
+              <Route path="/scanner/presets/:presetName/edit" element={<LegacyPresetEditorRedirect />} />
               <Route
                 path="/scanner/:scenarioName"
                 element={
-                  <ScenarioDetail
-                    activeTarget={activeTarget}
+                  registry.loading ? <Spinner label="Loading target defaults..." /> : registry.error ? (
+                    <MessageBar intent="error">
+                      <MessageBarBody>
+                        {registry.error}
+                        <Button onClick={registry.refresh}>Retry targets</Button>
+                      </MessageBarBody>
+                    </MessageBar>
+                  ) : <ScenarioDetail
+                    targets={registry.targets}
+                    defaultObjectiveTarget={targetDefaults.objectiveTarget}
+                    defaultAdversarialTarget={targetDefaults.adversarialTarget}
                     labels={globalLabels}
+                    operationId={operationId}
+                    defaultsReady={newActivityReady}
                     onNavigate={handleNavigate}
                   />
                 }
@@ -643,7 +904,11 @@ function App() {
               <Route path="/scenario-history" element={<LegacyScenarioHistoryRedirect />} />
               <Route path="/scenario-history/:scenarioResultId" element={<LegacyScenarioRunRedirect />} />
               <Route path="/config" element={<Configuration />} />
+              <Route path="/analytics" element={<AnalyticsPage onOpenAttack={handleOpenAttack} />} />
               <Route path="/history" element={<LegacyAttackHistoryRedirect />} />
+              <Route path="/operations" element={<OperationsPage />} />
+              <Route path="/operations/:operationId" element={<OperationDetailPage onOperationChanged={operation.retry} />} />
+              <Route path="/findings" element={<Navigate to="/operations" replace />} />
               <Route
                 path={HISTORY_ATTACKS_PATH}
                 element={
@@ -652,7 +917,7 @@ function App() {
                       onOpenAttack={handleOpenAttack}
                       filters={historyFilters}
                       onFiltersChange={handleFiltersChange}
-                      activeTarget={activeTarget}
+                      activeTarget={targetDefaults.objectiveTarget}
                       onNavigate={handleNavigate}
                       showTitle={false}
                     />
@@ -689,6 +954,26 @@ function App() {
           )}
       </ConnectionHealthProvider>
     </ErrorBoundary>
+  )
+}
+
+function App() {
+  const { instance, accounts = [] } = useMsal()
+  const authConfig = useAuthConfig()
+  const account = instance.getActiveAccount?.() ?? accounts[0]
+  const accountKey = account?.homeAccountId
+    ? `${account.tenantId}:${account.homeAccountId}`
+    : authConfig.clientId ? null : 'local'
+  const operatorAlias = account?.username ? account.username.split('@')[0].toLowerCase() : null
+  return (
+    <RuntimeProvider>
+      <RuntimeBanner />
+      <UserPreferencesProvider key={accountKey ?? 'account-loading'} accountKey={accountKey}>
+        <ThemeProvider>
+          <AppContent operatorAlias={operatorAlias} />
+        </ThemeProvider>
+      </UserPreferencesProvider>
+    </RuntimeProvider>
   )
 }
 

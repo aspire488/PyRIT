@@ -15,6 +15,8 @@ from pyrit.executor.attack.component import ConversationManager, PrependedConver
 from pyrit.executor.attack.component.adversarial_conversation_manager import _AdversarialConversationManager
 from pyrit.executor.attack.component.modality_router import _ModalityFeedbackRouter
 from pyrit.executor.attack.core import AttackAdversarialConfig, AttackConverterConfig, AttackScoringConfig
+from pyrit.executor.attack.core.attack_config import AdversarialPromptRequirements
+from pyrit.executor.attack.core.attack_scoring import score_attack_response_async
 from pyrit.executor.attack.core.attack_strategy import attack_outcome_from_score
 from pyrit.executor.attack.multi_turn.multi_turn_attack_strategy import (
     ConversationSession,
@@ -41,7 +43,6 @@ from pyrit.prompt_target import CapabilityName, TargetRequirements
 from pyrit.score import (
     FloatScaleThresholdScorer,
     MessageScorable,
-    MessageScorer,
     NumericRubric,
     SelfAskRefusalScorer,
     SelfAskScaleScorer,
@@ -139,6 +140,10 @@ class CrescendoAttack(MultiTurnAttackStrategy[CrescendoAttackContext, CrescendoA
     # Default system prompt template path for Crescendo attack
     DEFAULT_ADVERSARIAL_CHAT_SYSTEM_PROMPT_TEMPLATE_PATH: Path = (
         Path(EXECUTOR_SEED_PROMPT_PATH) / "crescendo" / "crescendo_variant_1.yaml"
+    )
+    ADVERSARIAL_PROMPT_REQUIREMENTS = AdversarialPromptRequirements(
+        default_system_prompt_path=DEFAULT_ADVERSARIAL_CHAT_SYSTEM_PROMPT_TEMPLATE_PATH,
+        system_prompt_parameters=("objective", "max_turns"),
     )
 
     @apply_defaults
@@ -242,11 +247,13 @@ class CrescendoAttack(MultiTurnAttackStrategy[CrescendoAttackContext, CrescendoA
         # The manager owns adversarial-prompt resolution. Crescendo is override mode: it builds each
         # adversarial prompt itself and passes the text explicitly, so only the system prompt is
         # resolved here (no first / next-message templates).
+        requirements = self.get_adversarial_prompt_requirements()
         self._resolved_adversarial = _AdversarialConversationManager.resolve_config(
             config=attack_adversarial_config,
-            default_system_prompt_path=CrescendoAttack.DEFAULT_ADVERSARIAL_CHAT_SYSTEM_PROMPT_TEMPLATE_PATH,
-            system_prompt_required_parameters=["objective", "max_turns"],
+            default_system_prompt_path=requirements.default_system_prompt_path,
+            system_prompt_required_parameters=list(requirements.system_prompt_parameters),
             system_prompt_error_message="Crescendo system prompt must have 'objective' and 'max_turns' parameters",
+            resolve_user_messages=requirements.accepts_user_messages,
         )
         self._adversarial_chat_system_prompt_template = self._resolved_adversarial.system_prompt
 
@@ -257,14 +264,24 @@ class CrescendoAttack(MultiTurnAttackStrategy[CrescendoAttackContext, CrescendoA
         )
 
         # Set the maximum number of backtracks and turns
-        if max_backtracks < 0:
-            raise ValueError("max_backtracks must be non-negative")
-
-        if max_turns <= 0:
-            raise ValueError("max_turns must be positive")
+        CrescendoAttack.validate_constructor_parameters({"max_backtracks": max_backtracks, "max_turns": max_turns})
 
         self._max_backtracks = max_backtracks
         self._max_turns = max_turns
+
+    @classmethod
+    def validate_constructor_parameters(cls, params: dict[str, Any]) -> None:
+        """
+        Validate search bounds without constructing an attack.
+
+        Raises:
+            ValueError: If backtracks are negative or turns are not positive.
+        """
+        super().validate_constructor_parameters(params)
+        if "max_backtracks" in params and params["max_backtracks"] < 0:
+            raise ValueError("max_backtracks must be non-negative")
+        if "max_turns" in params and params["max_turns"] <= 0:
+            raise ValueError("max_turns must be positive")
 
     def get_attack_scoring_config(self) -> AttackScoringConfig | None:
         """
@@ -362,8 +379,10 @@ class CrescendoAttack(MultiTurnAttackStrategy[CrescendoAttackContext, CrescendoA
 
         # Set the system prompt for adversarial chat via the manager, injecting Crescendo's
         # prepended-conversation context as an extra render value.
-        self._build_adversarial_manager(context=context).set_adversarial_system_prompt(
-            conversation_context=adversarial_chat_context,
+        (
+            await self._build_adversarial_manager(context=context).set_adversarial_system_prompt_async(
+                conversation_context=adversarial_chat_context
+            )
         )
 
         # Initialize backtrack count in context
@@ -707,7 +726,7 @@ class CrescendoAttack(MultiTurnAttackStrategy[CrescendoAttackContext, CrescendoA
             objective_target_conversation_id=context.session.conversation_id,
             objective=context.objective,
         ):
-            scoring_results = await MessageScorer.score_response_async(
+            scoring_results = await score_attack_response_async(
                 response=context.last_response,
                 objective_scorer=self._objective_scorer,
                 auxiliary_scorers=self._auxiliary_scorers,
@@ -733,7 +752,7 @@ class CrescendoAttack(MultiTurnAttackStrategy[CrescendoAttackContext, CrescendoA
             str: The new conversation ID after backtracking.
         """
         # Access memory through the conversation manager's memory instance
-        new_conversation_id = self._memory.duplicate_conversation_excluding_last_turn(
+        new_conversation_id = await self._memory.duplicate_conversation_excluding_last_turn_async(
             conversation_id=conversation_id,
         )
         self._logger.debug(f"Backtracked conversation from {conversation_id} to {new_conversation_id}")

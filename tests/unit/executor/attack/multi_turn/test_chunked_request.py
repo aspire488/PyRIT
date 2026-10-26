@@ -9,6 +9,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from unit.mocks import get_mock_prompt_normalizer
 
 from pyrit.executor.attack.component import PrependedConversationConfig
 from pyrit.executor.attack.component.prepended_history_send_context import (
@@ -21,7 +22,6 @@ from pyrit.executor.attack.multi_turn import (
 )
 from pyrit.message_normalizer import HistorySquashNormalizer, MessageStringNormalizer
 from pyrit.models import ComponentIdentifier, Message, MessagePiece
-from pyrit.prompt_normalizer import PromptNormalizer
 from pyrit.prompt_target import (
     CapabilityName,
     PromptTarget,
@@ -135,6 +135,7 @@ class TestChunkedRequestAttack:
         assert "1-50" in prompts[0]
         assert "51-100" in prompts[1]
         assert "101-150" in prompts[2]
+        assert "respond with the answer: 'Get the secret'" in prompts[0]
 
     def test_generate_chunk_prompts_custom_chunk_type(self):
         """Test chunk prompt generation with custom chunk type."""
@@ -271,7 +272,7 @@ class TestChunkedRequestAttackExecution:
     async def test_perform_async_forwards_prepended_formatter_override(self):
         mock_target = _make_mock_target()
         mock_target.configuration = TargetConfiguration(capabilities=TargetCapabilities(supports_multi_turn=True))
-        mock_normalizer = MagicMock(spec=PromptNormalizer)
+        mock_normalizer = get_mock_prompt_normalizer()
         mock_normalizer.send_prompt_async = AsyncMock(
             return_value=Message.from_prompt(prompt="chunk response", role="assistant")
         )
@@ -303,7 +304,7 @@ class TestChunkedRequestAttackExecution:
     async def test_perform_async_sets_atomic_attack_identifier(self):
         """Test that _perform_async sets atomic_attack_identifier in the correct AtomicAttack format."""
         mock_target = _make_mock_target()
-        mock_normalizer = MagicMock(spec=PromptNormalizer)
+        mock_normalizer = get_mock_prompt_normalizer()
         sample_response = Message(
             message_pieces=[
                 MessagePiece(role="assistant", original_value="chunk response", original_value_data_type="text")

@@ -3,10 +3,13 @@
 
 """Tests for the RedTeamAgent class."""
 
+import pathlib
+import threading
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from unit.mocks import MockPromptTarget
 
 from pyrit.converter import (
     AnsiAttackConverter,
@@ -40,15 +43,20 @@ from pyrit.executor.attack import (
 )
 from pyrit.executor.attack.core.attack_config import AttackScoringConfig
 from pyrit.executor.attack.core.attack_strategy import AttackStrategy
+from pyrit.memory import SQLiteMemory
 from pyrit.models import AttackSeedGroup, ComponentIdentifier, SeedObjective
-from pyrit.prompt_target import PromptTarget
-from pyrit.scenario import AtomicAttack, DatasetAttackConfiguration
+from pyrit.models.scenario_dataset import DatasetFetchPolicy
+from pyrit.models.seeds import yaml_seed_loader
+from pyrit.prompt_target import PromptTarget, TargetCapabilities, TargetConfiguration
+from pyrit.scenario import AtomicAttack, DatasetAttackConfiguration, IncompatibleTechniqueError
+from pyrit.scenario.core.scenario_context import ScenarioContext
 from pyrit.scenario.foundry import (  # type: ignore[ty:unresolved-import]
     FoundryComposite,
     FoundryTechnique,
     RedTeamAgent,
 )
 from pyrit.score import FloatScaleThresholdScorer, TrueFalseScorer
+from tests.unit.mocks import MockPromptTarget
 
 
 def _mock_scorer_id(name: str = "MockObjectiveScorer") -> ComponentIdentifier:
@@ -130,6 +138,12 @@ def mock_memory_seed_groups():
 def mock_dataset_config(mock_memory_seed_groups):
     """Create a mock dataset config that returns the seed groups."""
     mock_config = MagicMock(spec=DatasetAttackConfiguration)
+    mock_config.with_overrides.return_value = mock_config
+    mock_config.sources = ()
+    mock_config.max_total = "all"
+    mock_config.max_per_dataset = "all"
+    mock_config.fetch = DatasetFetchPolicy.IF_MISSING
+    mock_config._filters = {}
     mock_config.get_attack_seed_groups_async = AsyncMock(return_value=mock_memory_seed_groups)
     mock_config.dataset_names = ["foundry_red_team"]
     return mock_config
@@ -202,6 +216,162 @@ def mock_runtime_env():
 FIXTURES = ["patch_central_database", "mock_runtime_env"]
 
 
+@pytest.mark.usefixtures("patch_central_database")
+@pytest.mark.parametrize(
+    "technique", [FoundryTechnique.Crescendo, FoundryTechnique.Tap, FoundryTechnique.Jailbreak, FoundryTechnique.Tense]
+)
+async def test_foundry_templates_are_loaded_off_loop_async(
+    *,
+    technique: FoundryTechnique,
+    sqlite_instance: SQLiteMemory,
+    mock_float_threshold_scorer: FloatScaleThresholdScorer,
+) -> None:
+    backend_thread = threading.get_ident()
+    original_load = yaml_seed_loader._read_yaml
+
+    def load_template(file: str | pathlib.Path) -> dict[str, Any]:
+        assert threading.get_ident() != backend_thread
+        return original_load(file)
+
+    target = MockPromptTarget()
+    scenario = RedTeamAgent(
+        adversarial_chat=target,
+        attack_scoring_config=AttackScoringConfig(objective_scorer=mock_float_threshold_scorer),
+    )
+    scenario.set_params_from_args(
+        args={
+            "objective_target": target,
+            "scenario_techniques": [technique],
+            "dataset_config": DatasetAttackConfiguration(
+                seed_groups=[AttackSeedGroup(seeds=[SeedObjective(value="Say hello")])]
+            ),
+            "include_baseline": False,
+        }
+    )
+    with patch.object(yaml_seed_loader, "_read_yaml", side_effect=load_template) as read:
+        await scenario.initialize_async()
+    assert read.call_count > 0
+    assert scenario.atomic_attack_count == 1
+
+
+@pytest.mark.usefixtures(*FIXTURES)
+class TestFoundryCompatibilityPolicy:
+    @pytest.mark.parametrize("policy", [None, "skip", "raise"])
+    @pytest.mark.parametrize("composed", [False, True])
+    async def test_incompatible_attack_follows_policy_async(
+        self,
+        *,
+        policy: str | None,
+        composed: bool,
+        mock_adversarial_target: MagicMock,
+        mock_objective_scorer: MagicMock,
+        mock_memory_seed_groups: list[AttackSeedGroup],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        target = MockPromptTarget(
+            custom_configuration=TargetConfiguration(
+                capabilities=TargetCapabilities(
+                    supports_multi_turn=False,
+                    supports_editable_history=True,
+                    supports_system_prompt=True,
+                )
+            )
+        )
+        scenario = RedTeamAgent(
+            adversarial_chat=mock_adversarial_target,
+            attack_scoring_config=AttackScoringConfig(objective_scorer=mock_objective_scorer),
+        )
+        incompatible = (
+            FoundryComposite(attack=FoundryTechnique.Crescendo, converters=[FoundryTechnique.Base64])
+            if composed
+            else FoundryTechnique.Crescendo
+        )
+        scenario.set_params_from_args(
+            args={
+                "objective_target": target,
+                "scenario_techniques": [incompatible, FoundryTechnique.ROT13],
+                "incompatible_technique_policy": policy,
+                "dataset_config": DatasetAttackConfiguration(seed_groups=mock_memory_seed_groups),
+            }
+        )
+        with patch.object(
+            scenario,
+            "_resolve_seed_groups_by_dataset_async",
+            new_callable=AsyncMock,
+            return_value={"dataset": mock_memory_seed_groups},
+        ):
+            if policy == "raise":
+                with pytest.raises(IncompatibleTechniqueError, match="incompatible with the objective target"):
+                    await scenario.initialize_async()
+            else:
+                await scenario.initialize_async()
+                assert [atomic.atomic_attack_name for atomic in scenario._atomic_attacks] == ["baseline", "rot13"]
+                assert len([record for record in caplog.records if "Skipping Technique" in record.message]) == 1
+
+    async def test_baseline_cannot_hide_all_incompatible_techniques_async(
+        self,
+        *,
+        mock_adversarial_target: MagicMock,
+        mock_objective_scorer: MagicMock,
+        mock_memory_seed_groups: list[AttackSeedGroup],
+    ) -> None:
+        target = MockPromptTarget(
+            custom_configuration=TargetConfiguration(capabilities=TargetCapabilities(supports_multi_turn=False))
+        )
+        scenario = RedTeamAgent(
+            adversarial_chat=mock_adversarial_target,
+            attack_scoring_config=AttackScoringConfig(objective_scorer=mock_objective_scorer),
+        )
+        scenario.set_params_from_args(
+            args={
+                "objective_target": target,
+                "scenario_techniques": [FoundryTechnique.Crescendo],
+                "dataset_config": DatasetAttackConfiguration(seed_groups=mock_memory_seed_groups),
+            }
+        )
+        with patch.object(
+            scenario,
+            "_resolve_seed_groups_by_dataset_async",
+            new_callable=AsyncMock,
+            return_value={"dataset": mock_memory_seed_groups},
+        ):
+            with pytest.raises(IncompatibleTechniqueError, match="no usable selected techniques"):
+                await scenario.initialize_async()
+
+    @pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+    async def test_unrelated_construction_errors_are_not_skipped_async(
+        self,
+        *,
+        error_type: type[Exception],
+        mock_adversarial_target: MagicMock,
+        mock_objective_scorer: MagicMock,
+        mock_memory_seed_groups: list[AttackSeedGroup],
+    ) -> None:
+        scenario = RedTeamAgent(
+            adversarial_chat=mock_adversarial_target,
+            attack_scoring_config=AttackScoringConfig(objective_scorer=mock_objective_scorer),
+        )
+        scenario.set_params_from_args(
+            args={
+                "objective_target": MockPromptTarget(),
+                "scenario_techniques": [FoundryTechnique.Base64],
+                "incompatible_technique_policy": "skip",
+                "dataset_config": DatasetAttackConfiguration(seed_groups=mock_memory_seed_groups),
+            }
+        )
+        with (
+            patch.object(
+                scenario,
+                "_resolve_seed_groups_by_dataset_async",
+                new_callable=AsyncMock,
+                return_value={"dataset": mock_memory_seed_groups},
+            ),
+            patch.object(scenario, "_get_attack", side_effect=error_type("unrelated construction failure")),
+        ):
+            with pytest.raises(error_type, match="unrelated construction failure"):
+                await scenario.initialize_async()
+
+
 @pytest.mark.usefixtures(*FIXTURES)
 class TestFoundryInitialization:
     """Tests for RedTeamAgent initialization."""
@@ -271,6 +441,7 @@ class TestFoundryInitialization:
         )
 
         assert scenario._adversarial_chat == mock_adversarial_target
+        assert scenario.uses_default_adversarial_target is False
 
     def test_init_with_custom_scorer(self, mock_objective_target, mock_objective_scorer):
         """Test initialization with custom objective scorer."""
@@ -340,7 +511,7 @@ class TestFoundryInitialization:
         # Error should occur during initialize_async when it resolves seed groups.
         # Neutralize the provider fetch so the empty-memory path raises loudly instead of fetching.
         with patch(
-            "pyrit.scenario.core.dataset_configuration.DatasetConfiguration._fetch_dataset_async",
+            "pyrit.scenario.core.dataset_configuration.DatasetConfiguration.prepare_async",
             new_callable=AsyncMock,
         ):
             scenario.set_params_from_args(
@@ -490,6 +661,23 @@ class TestFoundryTechniqueNormalization:
 class TestFoundryAttackCreation:
     """Tests for attack creation from techniques."""
 
+    def test_nested_construction_uses_context_target_and_labels(
+        self, configured_scenario: RedTeamAgent, mock_memory_seed_groups: list[AttackSeedGroup]
+    ) -> None:
+        target = MockPromptTarget()
+        configured_scenario._resolve_scenario_techniques(scenario_techniques=[FoundryTechnique.Base64])
+        context = ScenarioContext(
+            objective_target=target,
+            scenario_techniques=[FoundryTechnique.Base64],
+            dataset_config=DatasetAttackConfiguration(seed_groups=mock_memory_seed_groups),
+            seed_groups=mock_memory_seed_groups,
+            memory_labels={"source": "context"},
+        )
+        assert configured_scenario._objective_target is not target
+        [atomic] = configured_scenario._build_atomic_attacks(context=context)
+        assert atomic.attack_technique.attack.get_objective_target() is target
+        assert atomic._memory_labels == context.memory_labels
+
     async def test_get_attack_from_single_turn_technique(
         self, mock_objective_target, mock_objective_scorer, mock_memory_seed_groups, mock_dataset_config
     ):
@@ -516,7 +704,9 @@ class TestFoundryAttackCreation:
             # Get the composite technique that was created during initialization
             composite_technique = scenario._scenario_composites[0]
             atomic_attack = scenario._get_attack_from_technique(
-                composite=composite_technique, seed_groups=mock_memory_seed_groups
+                context=scenario._build_scenario_context(seed_groups_by_dataset={}),
+                composite=composite_technique,
+                seed_groups=mock_memory_seed_groups,
             )
 
             assert isinstance(atomic_attack, AtomicAttack)
@@ -554,7 +744,9 @@ class TestFoundryAttackCreation:
             # Get the composite technique that was created during initialization
             composite_technique = scenario._scenario_composites[0]
             atomic_attack = scenario._get_attack_from_technique(
-                composite=composite_technique, seed_groups=mock_memory_seed_groups
+                context=scenario._build_scenario_context(seed_groups_by_dataset={}),
+                composite=composite_technique,
+                seed_groups=mock_memory_seed_groups,
             )
 
             assert isinstance(atomic_attack, AtomicAttack)
@@ -589,6 +781,7 @@ class TestFoundryGetAttack:
             await scenario.initialize_async()
 
             attack = scenario._get_attack(
+                objective_target=mock_objective_target,
                 attack_type=PromptSendingAttack,
                 converters=[Base64Converter()],
             )
@@ -625,6 +818,7 @@ class TestFoundryGetAttack:
             await scenario.initialize_async()
 
             attack = scenario._get_attack(
+                objective_target=mock_objective_target,
                 attack_type=CrescendoAttack,
                 converters=[],
             )
@@ -646,6 +840,7 @@ class TestFoundryAllTechniques:
     ) -> None:
         """Each converter technique creates its declared concrete converter."""
         atomic_attack = configured_scenario._get_attack_from_technique(
+            context=configured_scenario._build_scenario_context(seed_groups_by_dataset={}),
             composite=FoundryComposite(attack=None, converters=[technique]),
             seed_groups=mock_memory_seed_groups,
         )
@@ -666,6 +861,7 @@ class TestFoundryAllTechniques:
     ) -> None:
         """Each attack technique keeps its class, tree width, and supplied scorer."""
         atomic_attack = configured_scenario._get_attack_from_technique(
+            context=configured_scenario._build_scenario_context(seed_groups_by_dataset={}),
             composite=FoundryComposite(attack=technique),
             seed_groups=mock_memory_seed_groups,
         )
@@ -701,6 +897,7 @@ class TestFoundryAllTechniques:
     ) -> None:
         """Converters with fixed Foundry arguments retain those exact values."""
         atomic_attack = configured_scenario._get_attack_from_technique(
+            context=configured_scenario._build_scenario_context(seed_groups_by_dataset={}),
             composite=FoundryComposite(attack=None, converters=[technique]),
             seed_groups=mock_memory_seed_groups,
         )
@@ -716,6 +913,7 @@ class TestFoundryAllTechniques:
     ) -> None:
         """Tense keeps the past-tense setting and exact adversarial target."""
         atomic_attack = configured_scenario._get_attack_from_technique(
+            context=configured_scenario._build_scenario_context(seed_groups_by_dataset={}),
             composite=FoundryComposite(attack=None, converters=[FoundryTechnique.Tense]),
             seed_groups=mock_memory_seed_groups,
         )
@@ -738,6 +936,7 @@ class TestFoundryAllTechniques:
         ) as template_constructor:
             atomic_attacks = [
                 configured_scenario._get_attack_from_technique(
+                    context=configured_scenario._build_scenario_context(seed_groups_by_dataset={}),
                     composite=FoundryComposite(attack=None, converters=[FoundryTechnique.Jailbreak]),
                     seed_groups=mock_memory_seed_groups,
                 )
@@ -758,6 +957,7 @@ class TestFoundryAllTechniques:
     ) -> None:
         """Composite converters remain in caller-specified execution order."""
         atomic_attack = configured_scenario._get_attack_from_technique(
+            context=configured_scenario._build_scenario_context(seed_groups_by_dataset={}),
             composite=FoundryComposite(
                 attack=None,
                 converters=[
@@ -783,6 +983,7 @@ class TestFoundryAllTechniques:
 
         with pytest.raises(ValueError) as exc_info:
             configured_scenario._get_attack_from_technique(
+                context=configured_scenario._build_scenario_context(seed_groups_by_dataset={}),
                 composite=composite,
                 seed_groups=mock_memory_seed_groups,
             )
@@ -800,6 +1001,7 @@ class TestFoundryAllTechniques:
         unknown_attack.value = "unsupported"
 
         atomic_attack = configured_scenario._get_attack_from_technique(
+            context=configured_scenario._build_scenario_context(seed_groups_by_dataset={}),
             composite=FoundryComposite(attack=cast("FoundryTechnique", unknown_attack)),
             seed_groups=mock_memory_seed_groups,
         )

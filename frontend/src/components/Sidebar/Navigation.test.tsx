@@ -6,6 +6,8 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ThemeProvider, useTheme } from "../../hooks/useTheme";
+import { UserPreferencesProvider } from "@/hooks/useUserPreferences";
+import { readUserPreferences } from "@/utils/userPreferences";
 import { THEME_PRESETS } from "@/themes/themePresets";
 import type { ThemePreset } from "@/types";
 import Navigation from "./Navigation";
@@ -13,7 +15,7 @@ import Navigation from "./Navigation";
 const STORAGE_KEY = "pyrit.themeMode";
 
 const renderWithProvider = (ui: React.ReactElement) =>
-  render(<ThemeProvider>{ui}</ThemeProvider>);
+  render(<UserPreferencesProvider accountKey="local"><ThemeProvider>{ui}</ThemeProvider></UserPreferencesProvider>);
 
 describe("Navigation", () => {
   const defaultProps = {
@@ -39,7 +41,7 @@ describe("Navigation", () => {
     renderWithProvider(<Navigation {...defaultProps} />);
 
     expect(screen.getByRole("navigation", { name: "Primary" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Chat" })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: "Technique.execute" })).toHaveAttribute(
       "aria-current",
       "page"
     );
@@ -59,9 +61,12 @@ describe("Navigation", () => {
     expect(onNavigate).toHaveBeenCalledWith("home");
   });
 
-  it("renders the chat button", () => {
+  it("renders the Technique.execute button for chat", () => {
     renderWithProvider(<Navigation {...defaultProps} />);
-    expect(screen.getByRole("button", { name: "Chat" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Technique.execute" })).toHaveAttribute(
+      "title",
+      "Technique.execute"
+    );
   });
 
   it("renders the registry button", () => {
@@ -78,7 +83,7 @@ describe("Navigation", () => {
       <Navigation {...defaultProps} onNavigate={onNavigate} />
     );
 
-    await user.click(screen.getByRole("button", { name: "Chat" }));
+    await user.click(screen.getByRole("button", { name: "Technique.execute" }));
     expect(onNavigate).toHaveBeenCalledWith("chat");
   });
 
@@ -137,12 +142,28 @@ describe("Navigation", () => {
 
     expect(labels).toEqual([
       "Home",
-      "Chat",
+      "Technique.execute",
       "History",
+      "Analytics",
+      "Operations",
       "Scanner",
+      "Datasets",
       "Registry",
       "Configuration",
     ]);
+  });
+
+  it("marks Operations current and navigates to its view", async () => {
+    const user = userEvent.setup();
+    const onNavigate = jest.fn();
+    renderWithProvider(
+      <Navigation {...defaultProps} currentView="operations" onNavigate={onNavigate} />,
+    );
+
+    const button = screen.getByRole("button", { name: "Operations" });
+    expect(button).toHaveAttribute("aria-current", "page");
+    await user.click(button);
+    expect(onNavigate).toHaveBeenCalledWith("operations");
   });
 
   it("marks History current and navigates to its tabbed view", async () => {
@@ -162,6 +183,16 @@ describe("Navigation", () => {
     expect(onNavigate).toHaveBeenCalledWith("history");
   });
 
+  it("marks Analytics current and opens the explorer", async () => {
+    const user = userEvent.setup();
+    const onNavigate = jest.fn();
+    renderWithProvider(<Navigation {...defaultProps} currentView="analytics" onNavigate={onNavigate} />);
+    const button = screen.getByRole("button", { name: "Analytics" });
+    expect(button).toHaveAttribute("aria-current", "page");
+    await user.click(button);
+    expect(onNavigate).toHaveBeenCalledWith("analytics");
+  });
+
   it("calls onNavigate with 'scenarios' when the scenarios button is clicked", async () => {
     const user = userEvent.setup();
     const onNavigate = jest.fn();
@@ -178,6 +209,32 @@ describe("Navigation", () => {
       <Navigation {...defaultProps} currentView="scenarios" />
     );
     expect(screen.getByRole("button", { name: "Scanner" })).toHaveAttribute(
+      "aria-current",
+      "page"
+    );
+  });
+
+  it("renders the Datasets button", () => {
+    renderWithProvider(<Navigation {...defaultProps} />);
+    expect(screen.getByRole("button", { name: "Datasets" })).toBeInTheDocument();
+  });
+
+  it("calls onNavigate with 'datasets' when the datasets button is clicked", async () => {
+    const user = userEvent.setup();
+    const onNavigate = jest.fn();
+    renderWithProvider(
+      <Navigation {...defaultProps} onNavigate={onNavigate} />
+    );
+
+    await user.click(screen.getByRole("button", { name: "Datasets" }));
+    expect(onNavigate).toHaveBeenCalledWith("datasets");
+  });
+
+  it("marks the datasets button current when it is the active view", () => {
+    renderWithProvider(
+      <Navigation {...defaultProps} currentView="datasets" />
+    );
+    expect(screen.getByRole("button", { name: "Datasets" })).toHaveAttribute(
       "aria-current",
       "page"
     );
@@ -251,11 +308,11 @@ describe("Navigation", () => {
       return <span data-testid="mode">{mode}</span>;
     }
 
-    render(
-      <ThemeProvider>
+    renderWithProvider(
+      <>
         <Navigation {...defaultProps} />
         <Reader />
-      </ThemeProvider>
+      </>
     );
 
     expect(screen.getByTestId("mode")).toHaveTextContent("system");
@@ -264,7 +321,7 @@ describe("Navigation", () => {
     await user.click(screen.getByRole("menuitemradio", { name: "Dark" }));
 
     expect(screen.getByTestId("mode")).toHaveTextContent("dark");
-    expect(window.localStorage.getItem(STORAGE_KEY)).toBe("dark");
+    expect(readUserPreferences('local').theme).toBe("dark");
   });
 
   it("reflects the persisted mode in the trigger label", () => {
@@ -286,7 +343,7 @@ describe("Navigation", () => {
 
       await user.click(screen.getByRole("button", { name: "Theme: System" }));
       await user.click(screen.getByRole("menuitemradio", { name: preset.label }));
-      expect(window.localStorage.getItem(STORAGE_KEY)).toBe(id);
+      expect(readUserPreferences('local').theme).toBe(id);
       expect(onNavigate).not.toHaveBeenCalled();
 
       await user.click(screen.getByRole("button", { name: `Theme: ${preset.label}` }));

@@ -3,6 +3,11 @@ import type { DragEvent, KeyboardEvent, ReactNode } from 'react'
 
 import {
   Button,
+  Menu,
+  MenuTrigger,
+  MenuPopover,
+  MenuList,
+  MenuItem,
   MessageBar,
   MessageBarBody,
   Spinner,
@@ -15,12 +20,17 @@ import {
   OpenRegular,
   PlayRegular,
   ReOrderDotsVerticalRegular,
+  MoreHorizontalRegular,
 } from '@fluentui/react-icons'
 
 import CreateConverterDialog from '@/components/Registry/CreateConverterDialog'
+import { useRuntime } from '@/hooks/useRuntime'
 import { convertersApi } from '@/services/api'
 import { toApiError } from '@/services/errors'
-import type { ChatConverterController, ConverterInputPiece, ConverterInstance, ConverterPipelineStage } from '@/types'
+import type {
+  ChatConverterController, ConverterInputPiece, ConverterInstance, ConverterPipelineStage, ConverterStageResult,
+  SourceInstanceSpec, ConverterIdentifier, PieceConversionUpdates,
+} from '@/types'
 
 import {
   PIECE_TYPE_TO_DATA_TYPE,
@@ -30,6 +40,7 @@ import {
   isPathDataType,
 } from '../converterTypes'
 import { useConverterPanelStyles } from './ConverterPanel.styles'
+import ConversionTextEditor from './ConversionTextEditor'
 import SelectConverterInput from './SelectConverterInput'
 
 const PIECE_TYPE_LABELS: Record<string, string> = {
@@ -53,11 +64,17 @@ interface ValuePreviewProps {
   sectionTestId?: string
   testId?: string
   value?: string
+  editorLabel?: string
+  allowSelection?: boolean
+  edited?: boolean
+  onChange?: (value: string) => void
 }
 
 interface ConverterPanelProps {
   onClose: () => void
   controller: ChatConverterController
+  selectedMessageCount?: number
+  onApply?: (updates: PieceConversionUpdates) => void
 }
 
 interface SelectedConverter extends ConverterInstance {
@@ -71,7 +88,6 @@ function formatDataType(dataType: string): string {
     .replace(/\b\w/g, (character: string) => character.toUpperCase())
 }
 
-/** Read-only rendering of a value, using a media player whenever the type allows. */
 function ValuePreview({
   dataType,
   emptyText,
@@ -79,12 +95,24 @@ function ValuePreview({
   sectionTestId,
   testId,
   value = '',
+  editorLabel,
+  allowSelection = false,
+  edited = false,
+  onChange,
 }: ValuePreviewProps) {
   const styles = useConverterPanelStyles()
   const accessibleLabel = label ?? 'Converted output'
 
   let content: ReactNode
-  if (!value) {
+  if (dataType === 'text' && onChange) {
+    content = <ConversionTextEditor
+      value={value}
+      label={editorLabel ?? accessibleLabel}
+      placeholder={emptyText}
+      allowSelection={allowSelection}
+      onChange={onChange}
+    />
+  } else if (!value) {
     content = <Text className={styles.emptyPreview}>{emptyText}</Text>
   } else if (!isPathDataType(dataType)) {
     content = <pre className={styles.previewPre}>{value}</pre>
@@ -128,6 +156,7 @@ function ValuePreview({
           {label}
         </Text>
       )}
+      {edited && <Text size={200} className={styles.hintText}>Edited</Text>}
       <div className={styles.outputBox} data-testid={testId}>
         {content}
       </div>
@@ -138,17 +167,45 @@ function ValuePreview({
 export default function ConverterPanel({
   onClose,
   controller,
+  selectedMessageCount,
+  onApply,
 }: ConverterPanelProps) {
+  const { generation, ready } = useRuntime()
   const styles = useConverterPanelStyles()
   const [converters, setConverters] = useState<ConverterInstance[]>([])
   const [activeTab, setActiveTab] = useState('text')
-  const { inputs, pipelines, results, errors, isConverting, addConverter, setPipeline, retainConverters } = controller
+  const {
+    inputs, workingInputs, pipelines, stageResults, results, errors, isConverting,
+    addConverter, setPipeline, retainConverters,
+  } = controller
+  const isBatch = selectedMessageCount !== undefined && selectedMessageCount > 1
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [settings, setSettings] = useState<{
+    stageId: string
+    pieceType: string
+    editing: { converter: ConverterInstance; spec?: SourceInstanceSpec }
+  } | null>(null)
+  const [settingsGeneration, setSettingsGeneration] = useState(generation)
+  if (settingsGeneration !== generation) {
+    setSettingsGeneration(generation)
+    setSettings(null)
+  }
+  const discardTemporarySettings = controller.discardTemporarySettings
+  useEffect(() => () => discardTemporarySettings?.(), [discardTemporarySettings])
   const [panelWidth, setPanelWidth] = useState(DEFAULT_PANEL_WIDTH)
   const isResizing = useRef(false)
   const draggedConverterIndex = useRef<number | null>(null)
+  const applyResult = (applied: PieceConversionUpdates | void): void => {
+    if (applied) onApply?.(applied)
+  }
+  const convert = async (pieceType: string): Promise<void> => {
+    applyResult(await controller.convert(pieceType))
+  }
+  const convertRemaining = async (pieceId: string, stageId: string): Promise<void> => {
+    applyResult(await controller.convertRemaining(pieceId, stageId))
+  }
 
   const tabs = useMemo(() => {
     const seen = new Set(['text'])
@@ -198,6 +255,7 @@ export default function ConverterPanel({
   }, [retainConverters, addConverter])
 
   useEffect(() => {
+    if (!ready) return
     let cancelled = false
     void convertersApi.listConverters()
       .then((response) => {
@@ -217,12 +275,12 @@ export default function ConverterPanel({
     return () => {
       cancelled = true
     }
-  }, [retainConverters])
+  }, [generation, ready, retainConverters])
 
   const selectedConverters = useMemo(
     () => selectedStages.flatMap((stage: ConverterPipelineStage): SelectedConverter[] => {
       const converter = converters.find((candidate: ConverterInstance) => candidate.converter_id === stage.converterId)
-      return converter ? [{ ...converter, stageId: stage.id }] : []
+      return converter ? [{ ...converter, identifier: stage.identifier ?? converter.identifier, stageId: stage.id }] : []
     }),
     [converters, selectedStages],
   )
@@ -250,11 +308,9 @@ export default function ConverterPanel({
     .filter((type: string) => groups[type]?.length)
     .map((type: string) => ({ type, converters: groups[type] }))
 
-  const configuredPieceTypes = tabs.filter(
-    (pieceType: string) => (pipelines[pieceType]?.length ?? 0) > 0,
-  )
-  const convertibleInputs = inputs.filter(
-    (input: ConverterInputPiece) => input.value.trim() && pipelines[input.pieceType]?.length,
+  const activePipelineConfigured = selectedStages.length > 0
+  const convertibleInputs = activeInputs.filter(
+    (input: ConverterInputPiece) => (workingInputs[input.id] ?? input.value).trim(),
   )
 
   const handleConverterSelect = useCallback((converterId: string): void => {
@@ -350,7 +406,9 @@ export default function ConverterPanel({
           <div className={styles.headerTitle}>
             <Text weight="semibold" size={300}>Converters</Text>
             <Text size={200} className={styles.hintText}>
-              Build and convert registered converter pipelines.
+              {selectedMessageCount === undefined
+                ? 'Build and convert registered converter pipelines.'
+                : 'Select messages in chat.'}
             </Text>
           </div>
           <Button
@@ -383,7 +441,14 @@ export default function ConverterPanel({
           </TabList>
         )}
         <div className={styles.body}>
-          {activeInputs.map((input: ConverterInputPiece) => <ValuePreview
+          {!isLoading && !error && (
+            <SelectConverterInput
+              groupedConverters={groupedConverters}
+              onOptionSelect={handleConverterSelect}
+              onCreateNew={() => setCreateDialogOpen(true)}
+            />
+          )}
+          {!isBatch && activeInputs.map((input: ConverterInputPiece) => <ValuePreview
             key={input.id}
             dataType={input.dataType}
             emptyText={
@@ -392,8 +457,14 @@ export default function ConverterPanel({
                 : `Attach a ${effectiveActiveTab} file in the chat input.`
             }
             label={input.pieceType === 'text' ? 'Input - Text' : `Input - ${input.name}`}
+            editorLabel={`Working input - ${input.name}`}
+            allowSelection={selectedConverters.length > 0}
+            edited={workingInputs[input.id] !== undefined && workingInputs[input.id] !== input.value}
+            onChange={input.dataType === 'text'
+              ? (value: string) => applyResult(controller.editInput(input.id, value))
+              : undefined}
             testId="converter-input-value"
-            value={input.value}
+            value={workingInputs[input.id] ?? input.value}
           />)}
           {isLoading && (
             <div className={styles.loading} data-testid="converter-panel-loading">
@@ -407,22 +478,21 @@ export default function ConverterPanel({
           )}
           {!isLoading && !error && (
             <div className={styles.converterList} data-testid="converter-panel-list">
-              <SelectConverterInput
-                groupedConverters={groupedConverters}
-                onOptionSelect={handleConverterSelect}
-                onCreateNew={() => setCreateDialogOpen(true)}
-              />
-              {configuredPieceTypes.length > 0 && (
+              {activePipelineConfigured && (
                 <Button
                   appearance="primary"
                   size="small"
                   icon={isConverting ? <Spinner size="tiny" /> : <PlayRegular />}
-                  onClick={() => void controller.convert()}
-                  disabled={isConverting || convertibleInputs.length === 0}
+                  onClick={() => void convert(effectiveActiveTab)}
+                  disabled={!ready || isConverting || convertibleInputs.length === 0}
                   className={styles.previewButton}
+                  title={`Convert the configured ${
+                    PIECE_TYPE_LABELS[effectiveActiveTab] ?? effectiveActiveTab
+                  } chain and any configured inputs without results.`}
                   data-testid="converter-preview-btn"
                 >
-                  {isConverting ? 'Converting...' : 'Convert'}
+                  {isConverting ? 'Converting...' : selectedMessageCount === undefined
+                    ? 'Convert' : `Convert ${selectedMessageCount} message${selectedMessageCount === 1 ? '' : 's'}`}
                 </Button>
               )}
               {inputs.filter((input: ConverterInputPiece) => errors[input.id]).map((input: ConverterInputPiece) => (
@@ -480,6 +550,7 @@ export default function ConverterPanel({
                         {converter.converter_id}
                       </Text>
                       {converter.is_llm_based && <span className={styles.llmBadge}>LLM</span>}
+                      {selectedStages[index]?.temporary && <Text size={200}>Temporary</Text>}
                       <Button
                         appearance="subtle"
                         size="small"
@@ -487,7 +558,7 @@ export default function ConverterPanel({
                         data-no-drag
                         aria-label={`Remove converter ${converter.converter_id}${duplicateStageContext}`}
                         onClick={() => removeConverter(index)}
-                        className={styles.touchTarget}
+                        className={styles.removeConverterButton}
                       />
                     </div>
                     {converter.identifier.class_name !== converter.converter_id && (
@@ -498,35 +569,102 @@ export default function ConverterPanel({
                     <Text size={200} className={styles.hintText}>
                       {converter.description || 'No description is available.'}
                     </Text>
-                    {activeInputs.map((input: ConverterInputPiece) => {
-                      const response = results[input.id]
-                      const stage = response?.steps[index]
-                      return <ValuePreview
-                        key={input.id}
-                        label={activeInputs.length > 1 ? input.name : undefined}
-                        dataType={stage?.output_data_type ?? converter.identifier.supported_output_types?.[0] ?? 'text'}
-                        emptyText={response
-                          ? 'This stage returned an empty value.'
-                          : 'Choose Convert to see this stage output.'}
-                        sectionTestId={`converter-stage-output-${index}`}
-                        testId={response && index === selectedConverters.length - 1
-                          ? 'converter-preview-result'
-                          : undefined}
-                        value={stage?.output_value}
-                      />
+                    {!isBatch && activeInputs.map((input: ConverterInputPiece) => {
+                      const stage = stageResults[input.id]?.find(
+                        (result: ConverterStageResult) => result.stageId === converter.stageId,
+                      )
+                      const hasRemaining = index < selectedConverters.length - 1
+                      const outputType = stage?.generated.output_data_type
+                        ?? converter.identifier.supported_output_types?.[0] ?? 'text'
+                      return (
+                        <div key={input.id} className={styles.valueSection}>
+                          <ValuePreview
+                            label={activeInputs.length > 1 ? input.name : undefined}
+                            editorLabel={`Stage ${index + 1} output - ${input.name}`}
+                            dataType={outputType}
+                            emptyText={stage
+                              ? 'This stage returned an empty value.'
+                              : 'Choose Convert above to see this stage output.'}
+                            sectionTestId={`converter-stage-output-${index}`}
+                            testId={results[input.id] && !hasRemaining ? 'converter-preview-result' : undefined}
+                            value={stage?.value}
+                            edited={stage !== undefined && stage.value !== stage.generated.output_value}
+                            allowSelection={hasRemaining}
+                            onChange={stage && outputType === 'text'
+                              ? (value: string) => applyResult(controller.editStageOutput(input.id, converter.stageId, value))
+                              : undefined}
+                          />
+                          {hasRemaining && (
+                            <Button
+                              size="small"
+                              icon={<PlayRegular />}
+                              className={styles.previewButton}
+                              disabled={isConverting || stage === undefined}
+                              aria-label={`Convert ${input.name} from stage ${index + 2} to end`}
+                              title="Convert all remaining stages from this value."
+                              onClick={() => void convertRemaining(input.id, converter.stageId)}
+                            >
+                              Convert
+                            </Button>
+                          )}
+                        </div>
+                      )
                     })}
+                    <div className={styles.converterCardFooter}>
+                      <Menu>
+                        <MenuTrigger disableButtonEnhancement>
+                          <Button
+                            appearance="subtle"
+                            size="small"
+                            icon={<MoreHorizontalRegular />}
+                            className={styles.settingsButton}
+                            aria-label={`Settings for converter ${converter.converter_id}${duplicateStageContext}`}
+                            disabled={isConverting}
+                          />
+                        </MenuTrigger>
+                        <MenuPopover><MenuList>
+                          <MenuItem disabled={!converter.reconstructable}
+                            title={converter.reconstructable ? undefined
+                              : converter.reconstruction_error ?? 'This converter does not support separate settings.'}
+                            onClick={() => setSettings({
+                              stageId: converter.stageId, pieceType: effectiveActiveTab,
+                              editing: { converter, spec: selectedStages[index]?.temporary },
+                            })}>Settings</MenuItem>
+                          {selectedStages[index]?.temporary && <MenuItem
+                            onClick={() => setPipeline(effectiveActiveTab, (stages) => stages.map((stage) =>
+                              stage.id === converter.stageId
+                                ? { id: stage.id, converterId: stage.converterId } : stage,
+                            ))}>Reset to registered converter</MenuItem>}
+                        </MenuList></MenuPopover>
+                      </Menu>
+                    </div>
                   </div>
                 )
               })}
-              <Button
-                appearance="primary"
-                onClick={controller.apply}
-                disabled={isConverting || Object.keys(results).length === 0}
-                className={styles.addConvertedButton}
-                data-testid="use-converted-btn"
-              >
-                Add converted value
-              </Button>
+              {isBatch && Object.keys(results).length > 0 && (
+                <section className={styles.resultsSection} aria-label="Converted messages">
+                  <Text weight="semibold">Converted messages</Text>
+                  {inputs.filter((input: ConverterInputPiece) => results[input.id]).map((input: ConverterInputPiece) => (
+                    <section key={input.id} className={styles.resultPair} aria-label={input.name}>
+                      <Text size={200} className={styles.hintText}>{input.name}</Text>
+                      <ValuePreview
+                        label="Original message"
+                        dataType={input.dataType}
+                        value={input.value}
+                        emptyText="The original message is empty."
+                        testId="converter-original-message"
+                      />
+                      <ValuePreview
+                        label="Converted message"
+                        dataType={results[input.id].converted_value_data_type}
+                        value={results[input.id].converted_value}
+                        emptyText="This conversion returned an empty value."
+                        testId="converter-final-result"
+                      />
+                    </section>
+                  ))}
+                </section>
+              )}
             </div>
           )}
         </div>
@@ -544,6 +682,18 @@ export default function ConverterPanel({
           void loadConverters(converterId, effectiveActiveTab)
         }}
       />
+      {settings && <CreateConverterDialog
+        open
+        editing={settings.editing}
+        onClose={() => setSettings(null)}
+        onCreated={() => { throw new Error('Settings must not register a converter.') }}
+        onTemporary={(spec: SourceInstanceSpec, identifier: ConverterIdentifier) => {
+          setPipeline(settings.pieceType, (stages: ConverterPipelineStage[]) => stages.map((stage) =>
+            stage.id === settings.stageId ? { ...stage, temporary: spec, identifier } : stage,
+          ))
+          setSettings(null)
+        }}
+      />}
     </div>
   )
 }

@@ -4,21 +4,25 @@
 import asyncio
 import logging
 import mimetypes
+import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
+from urllib.parse import urlencode
 
 import aiofiles
 import httpx
 
 from pyrit.common.deprecation import print_deprecation_message
 from pyrit.models import (
+    ComponentIdentifier,
     Message,
     MessagePiece,
     construct_response_from_request,
 )
 from pyrit.prompt_target.common.target_capabilities import TargetCapabilities
 from pyrit.prompt_target.common.target_configuration import TargetConfiguration
+from pyrit.prompt_target.common.target_trace_config import TargetTraceConfig, request_trace_headers
 from pyrit.prompt_target.common.utils import limit_requests_per_minute
 from pyrit.prompt_target.http_target.http_target import HTTPTarget
 
@@ -36,6 +40,7 @@ class HTTPXAPITarget(HTTPTarget):
     """
 
     _PATH_TYPES: frozenset[str] = frozenset({"image_path", "audio_path", "video_path", "binary_path"})
+    upload_directory_parameter: ClassVar[str | None] = "allowed_upload_directory"
     _DEFAULT_CONFIGURATION: TargetConfiguration = TargetConfiguration(
         capabilities=TargetCapabilities(
             supports_multi_turn=True,
@@ -50,6 +55,83 @@ class HTTPXAPITarget(HTTPTarget):
             ),
         )
     )
+    _CREDENTIAL_QUERY_NAME_TOKENS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "key",
+            "keys",
+            "token",
+            "tokens",
+            "secret",
+            "secrets",
+            "password",
+            "passwords",
+            "passwd",
+            "pwd",
+            "auth",
+            "authorization",
+            "credential",
+            "credentials",
+            "sig",
+            "signature",
+            "signatures",
+            "jwt",
+            "assertion",
+            "assertions",
+            "bearer",
+            "apikey",
+            "oauth",
+        }
+    )
+
+    @classmethod
+    def _is_sensitive_query_param(cls, key: str) -> bool:
+        # Match credential parameter names by word, not by substring: `design`
+        # contains "sig" and `author` contains "auth", but neither is a
+        # credential, and stripping them collapses distinct URLs into one
+        # identifier. Splitting on non-alphanumeric separators and on camelCase
+        # word boundaries keeps compound credential names (`api_key`,
+        # `client_secret`, `access_token`, `accessToken`, `clientSecret`)
+        # sensitive while leaving unrelated names intact.
+        tokens = {
+            token.lower()
+            for token in re.split(r"[^a-zA-Z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", key)
+            if token
+        }
+        if tokens & cls._CREDENTIAL_QUERY_NAME_TOKENS:
+            return True
+        return key.lower() in {"code", "pass"}
+
+    @classmethod
+    def _redact_url_for_identifier(cls, url: httpx.URL | str) -> str:
+        parsed_url = httpx.URL(url) if not isinstance(url, httpx.URL) else url
+        # The fragment is never part of the HTTP request target, and can carry
+        # credentials (e.g. '#access_token=...'), so it is dropped entirely.
+        cleaned_url = parsed_url.copy_with(username=None, password=None, fragment=None)
+        if cleaned_url.query:
+            query_items = [(k, v) for k, v in cleaned_url.params.multi_items() if not cls._is_sensitive_query_param(k)]
+            new_query = urlencode(query_items) if query_items else None
+            cleaned_url = cleaned_url.copy_with(query=new_query.encode("ascii") if new_query else None)
+        return str(cleaned_url)
+
+    @staticmethod
+    def _merge_base_and_url(base_url: httpx.URL, url: httpx.URL) -> httpx.URL:
+        """
+        Resolve ``url`` against ``base_url`` exactly like ``httpx.AsyncClient`` does.
+
+        ``httpx.AsyncClient._merge_url`` ensures the base URL ends in ``'/'`` and
+        appends the request path with any leading ``'/'`` stripped, so relative
+        URLs and absolute paths are appended to the base path rather than
+        replacing it — unlike ``httpx.URL.join``, which RFC 3986-resolves and can
+        collapse distinct base paths into the same identifier endpoint.
+
+        Returns:
+            The URL the client would actually send the request to.
+        """
+        base = base_url
+        if not base.raw_path.endswith(b"/"):
+            base = base.copy_with(raw_path=base.raw_path + b"/")
+        merged_raw_path = base.raw_path + url.raw_path.lstrip(b"/")
+        return base.copy_with(raw_path=merged_raw_path)
 
     def __init__(
         self,
@@ -67,6 +149,7 @@ class HTTPXAPITarget(HTTPTarget):
         callback_function: Callable[..., Any] | None = None,
         max_requests_per_minute: int | None = None,
         custom_configuration: TargetConfiguration | None = None,
+        trace_config: TargetTraceConfig | None = None,
         **httpx_client_kwargs: Any,
     ) -> None:
         """
@@ -91,6 +174,9 @@ class HTTPXAPITarget(HTTPTarget):
             custom_configuration (TargetConfiguration, Optional): Override the default configuration for this target
             instance.
             Defaults to None.
+            trace_config: Request tracing configuration. Tracing is disabled by default because an
+                arbitrary HTTP endpoint is not known to support W3C trace context. Pass
+                ``TargetTraceConfig(enabled=True)`` for an instrumented endpoint.
             **httpx_client_kwargs: Additional keyword arguments to pass to the httpx.AsyncClient constructor.
 
         Raises:
@@ -106,10 +192,26 @@ class HTTPXAPITarget(HTTPTarget):
             callback_function=callback_function,
             max_requests_per_minute=max_requests_per_minute,
             custom_configuration=custom_configuration,
+            trace_config=trace_config,
             **httpx_client_kwargs,
         )
 
         self.http_url = http_url
+
+        base_url = httpx_client_kwargs.get("base_url")
+        if not base_url and self._client:
+            client_base_url = getattr(self._client, "base_url", None)
+            if client_base_url and str(client_base_url):
+                base_url = client_base_url
+
+        merge_url = httpx.URL(http_url)
+        if merge_url.is_relative_url and base_url and str(base_url):
+            resolved_url = self._merge_base_and_url(httpx.URL(base_url), merge_url)
+        else:
+            resolved_url = merge_url
+
+        self._endpoint = self._redact_url_for_identifier(resolved_url)
+        self._destination_origin = self._get_destination_origin(str(resolved_url))
         self.method = method
         self.file_path = file_path
         self.allowed_upload_directory = self._resolve_allowed_upload_directory(allowed_upload_directory)
@@ -122,6 +224,22 @@ class HTTPXAPITarget(HTTPTarget):
         # Validate method
         if self.method not in {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}:
             raise ValueError(f"Invalid HTTP method: {self.method}")
+
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build the identifier with HTTPX API target-specific parameters.
+
+        Returns:
+            ComponentIdentifier: The identifier for this target instance.
+        """
+        return self._create_identifier(
+            params={
+                "method": self.method,
+                "follow_redirects": self.follow_redirects,
+                "callback_function": getattr(self.callback_function, "__name__", None),
+                "http2": self.http2,
+            },
+        )
 
     @limit_requests_per_minute
     async def _send_prompt_to_target_async(self, *, normalized_conversation: list[Message]) -> list[Message]:
@@ -153,6 +271,7 @@ class HTTPXAPITarget(HTTPTarget):
         http2_version = self.http2 if self.http2 is not None else False
 
         async with httpx.AsyncClient(http2=http2_version, **self.httpx_client_kwargs) as client:
+            headers = request_trace_headers(request=message, headers=self.headers, default_headers=client.headers)
             try:
                 if upload_path:
                     # Handle file upload (only for POST & PUT)
@@ -168,7 +287,7 @@ class HTTPXAPITarget(HTTPTarget):
                     response = await client.request(
                         method=self.method,
                         url=self.http_url,
-                        headers=self.headers,
+                        headers=headers,
                         params=self.params,
                         files=files,
                         follow_redirects=self.follow_redirects,
@@ -179,7 +298,7 @@ class HTTPXAPITarget(HTTPTarget):
                     response = await client.request(
                         method=self.method,
                         url=self.http_url,
-                        headers=self.headers,
+                        headers=headers,
                         params=self.params,
                         json=self.json_data if self.method in {"POST", "PUT", "PATCH"} else None,
                         data=self.form_data if self.method in {"POST", "PUT", "PATCH"} else None,
@@ -196,7 +315,7 @@ class HTTPXAPITarget(HTTPTarget):
                 logger.error(f"File not found: {self.file_path}. Exception: {e}")
                 raise
 
-        response_content = response.content
+        response_content = response.text
 
         # If a callback function was set, let them parse the response
         if self.callback_function:

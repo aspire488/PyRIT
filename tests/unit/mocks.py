@@ -5,13 +5,19 @@ import os
 import shutil
 import tempfile
 import uuid
-from collections.abc import Generator, MutableSequence, Sequence
+from collections.abc import AsyncGenerator, Callable, MutableSequence, Sequence
 from contextlib import AbstractAsyncContextManager
-from typing import Any
+from typing import Any, TypeVar
 from unittest.mock import MagicMock, patch
+
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.orm import Session
 
 from pyrit.memory import AzureSQLMemory, CentralMemory, MemoryInterface, PromptMemoryEntry
 from pyrit.models import (
+    AttackOutcome,
+    AttackResult,
+    AttackResultRole,
     ComponentIdentifier,
     Message,
     MessagePiece,
@@ -19,7 +25,38 @@ from pyrit.models import (
     ScenarioResult,
     flatten_to_message_pieces,
 )
+from pyrit.prompt_normalizer import PromptNormalizer
 from pyrit.prompt_target import PromptTarget, TargetCapabilities, TargetConfiguration, limit_requests_per_minute
+from pyrit.scenario.core.scenario_technique import ScenarioTechnique
+
+T = TypeVar("T")
+
+
+async def add_legacy_attack_results_async(memory: MemoryInterface, *, attack_results: Sequence[AttackResult]) -> None:
+    """Store attacks attributed only by Operation name, like rows written before Operation IDs existed."""
+    with patch.object(MemoryInterface, "_validate_activity_operation"):
+        await memory.add_attack_results_to_memory_async(attack_results=attack_results)
+
+
+async def run_memory_session_async(*, memory: MemoryInterface, operation: Callable[[Session], T]) -> T:
+    """Run a test's direct ORM operation on the async memory connection."""
+    async with await memory.get_session_async() as session:
+        return await session.run_sync(operation)
+
+
+def make_technique_class(*, techniques: Sequence[str], aggregates: Sequence[str] = ()) -> type[ScenarioTechnique]:
+    """
+    Build the technique catalog a scenario declaring these names would have.
+
+    ``ScenarioMetadata`` carries the catalog itself so that preset validation and the
+    launch path resolve technique tokens through one implementation, so a test building
+    metadata by hand needs a catalog that agrees with the names it passes.
+    """
+    members = [(name.upper(), (name, {"all"})) for name in aggregates]
+    members += [(name.upper(), (name, set())) for name in techniques]
+    # The functional Enum API builds a new enum class, but the overload ty selects is the
+    # member-lookup form, so it infers an instance rather than the class this returns.
+    return ScenarioTechnique("MockTechnique", members)  # ty: ignore[invalid-return-type]
 
 
 def make_scenario_identifier(
@@ -88,6 +125,59 @@ def make_scenario_result(
         pyrit_version=pyrit_version,
     )
     return ScenarioResult(scenario_identifier=identifier, **kwargs)
+
+
+def make_sequential_attack_results(
+    *,
+    atomic_attack_name: str,
+    envelope_outcome: AttackOutcome,
+    child_outcomes: Sequence[AttackOutcome],
+    child_technique_names: Sequence[str] | None = None,
+    objective: str = "obj",
+    with_result_roles: bool = True,
+) -> tuple[AttackResult, list[AttackResult]]:
+    """
+    Build the rows a scenario persists for one ``SequentialAttack`` execution.
+
+    Mirrors the hydrated rows: the orchestration envelope has no conversation of its own and
+    links its target-facing children, which share its attribution and record their position.
+    With ``with_result_roles=False``, the rows omit the role and position, like rows persisted
+    before roles were recorded.
+
+    Returns:
+        tuple[AttackResult, list[AttackResult]]: The envelope and its children in attempt order.
+    """
+    attribution = {
+        "parent_collection": atomic_attack_name,
+        "parent_eval_hash": "eval",
+        "seed_group_id": f"seed-{objective}",
+    }
+
+    def attribution_with(**recorded: str | int) -> dict[str, str | int]:
+        return {**attribution, **recorded} if with_result_roles else dict(attribution)
+
+    names = child_technique_names if child_technique_names is not None else [""] * len(child_outcomes)
+    children = [
+        AttackResult(
+            conversation_id=str(uuid.uuid4()),
+            objective=objective,
+            outcome=outcome,
+            attribution_data=attribution_with(result_role=AttackResultRole.TARGET_FACING.value, attempt_index=index),
+            metadata={AttackResult.TECHNIQUE_NAME_METADATA_KEY: name} if name else {},
+        )
+        for index, (outcome, name) in enumerate(zip(child_outcomes, names, strict=True), start=1)
+    ]
+    envelope = AttackResult(
+        conversation_id="",
+        objective=objective,
+        outcome=envelope_outcome,
+        attribution_data=attribution_with(result_role=AttackResultRole.ORCHESTRATION.value),
+        metadata={
+            "child_attack_result_ids": [child.attack_result_id for child in children],
+            "completion_policy": "first_success",
+        },
+    )
+    return envelope, children
 
 
 def get_mock_scorer_identifier() -> ComponentIdentifier:
@@ -205,12 +295,18 @@ class MockPromptTarget(PromptTarget):
 
     prompt_sent: list[str]
 
-    def __init__(self, *, id=None, rpm=None) -> None:  # noqa: A002
-        super().__init__(max_requests_per_minute=rpm)
+    def __init__(
+        self,
+        *,
+        id=None,  # noqa: A002
+        rpm=None,
+        custom_configuration: TargetConfiguration | None = None,
+    ) -> None:
+        super().__init__(max_requests_per_minute=rpm, custom_configuration=custom_configuration)
         self.id = id
         self.prompt_sent = []
 
-    def set_system_prompt(
+    async def set_system_prompt_async(
         self,
         *,
         system_prompt: str,
@@ -220,7 +316,7 @@ class MockPromptTarget(PromptTarget):
     ) -> None:
         self.system_prompt = system_prompt
         if self._memory:
-            self._memory.add_message_to_memory(
+            await self._memory.add_message_to_memory_async(
                 request=MessagePiece(
                     role="system",
                     original_value=system_prompt,
@@ -248,7 +344,7 @@ class MockPromptTarget(PromptTarget):
         """
 
 
-def get_azure_sql_memory() -> Generator[AzureSQLMemory, None, None]:
+async def get_azure_sql_memory_async() -> AsyncGenerator[AzureSQLMemory, None]:
     # Create a test Azure SQL Server DB using in-memory SQLite
     # This allows testing actual SQL queries (including JOINs and metadata filtering)
     # without requiring a real Azure SQL instance
@@ -261,31 +357,41 @@ def get_azure_sql_memory() -> Generator[AzureSQLMemory, None, None]:
         )
         os.environ[AzureSQLMemory.AZURE_STORAGE_ACCOUNT_DB_DATA_SAS_TOKEN] = "valid_sas_token"
 
-        # Use in-memory SQLite instead of mock to allow real SQL queries
-        azure_sql_memory = AzureSQLMemory(
-            connection_string="sqlite:///:memory:",
+        temp_dir = tempfile.mkdtemp()
+        database = os.path.join(temp_dir, "azure-test.db")
+        # Both test engines use SQLite; no Azure credentials or service calls are allowed.
+        azure_sql_memory = AzureSQLMemory.__new__(AzureSQLMemory)
+        azure_sql_memory.__init__(
+            connection_string=f"sqlite:///{database}",
             results_container_url=os.environ[AzureSQLMemory.AZURE_STORAGE_ACCOUNT_DB_DATA_CONTAINER_URL],
             results_sas_token=os.environ[AzureSQLMemory.AZURE_STORAGE_ACCOUNT_DB_DATA_SAS_TOKEN],
+            _defer_initialization=True,
         )
 
         create_auth_token_mock.return_value = "token"
         enable_azure_authorization_mock.return_value = None
 
         # Create a temporary directory for results
-        temp_dir = tempfile.mkdtemp()
         azure_sql_memory.results_path = temp_dir
 
         azure_sql_memory.disable_embedding()
 
         # Initialize the database schema
-        azure_sql_memory.reset_database()
+        await azure_sql_memory.reset_database_async()
 
         CentralMemory.set_memory_instance(azure_sql_memory)
-        yield azure_sql_memory
+        try:
+            with patch.object(
+                azure_sql_memory,
+                "_create_async_engine",
+                side_effect=lambda: create_async_engine(f"sqlite+aiosqlite:///{database}"),
+            ):
+                yield azure_sql_memory
+        finally:
+            await azure_sql_memory.dispose_engine_async()
 
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
-    azure_sql_memory.dispose_engine()
 
 
 def get_image_message_piece() -> MessagePiece:
@@ -333,13 +439,22 @@ def mock_memory_resolving(*messages: Message) -> MagicMock:
     """
     known = {str(piece.id): piece for message in messages for piece in message.message_pieces}
     memory = MagicMock(MemoryInterface)
-    memory.get_message_pieces.side_effect = lambda **kwargs: [
+    memory.get_message_pieces_async.side_effect = lambda **kwargs: [
         known[str(piece_id)] for piece_id in kwargs.get("prompt_ids", []) or [] if str(piece_id) in known
     ]
     return memory
 
 
-def store_message(message: Message) -> Message:
+def get_mock_prompt_normalizer() -> MagicMock:
+    """Build a normalizer mock with an async memory contract."""
+    normalizer = MagicMock(spec=PromptNormalizer)
+    normalizer.memory = MagicMock(spec=MemoryInterface)
+    normalizer.memory.get_message_pieces_async.return_value = []
+    normalizer.memory.delete_conversation_pieces_after_sequence_async.return_value = 0
+    return normalizer
+
+
+async def store_message_async(message: Message) -> Message:
     """
     Persist a message so a scorable can name its pieces, and return it.
 
@@ -356,8 +471,8 @@ def store_message(message: Message) -> Message:
         Message: The same message.
     """
     memory = CentralMemory.get_memory_instance()
-    piece_ids = [piece.id for piece in message.message_pieces if piece.id is not None]
-    if not piece_ids or memory.get_message_pieces(prompt_ids=piece_ids):
+    piece_ids = [piece.id for piece in message.message_pieces]
+    if not piece_ids or await memory.get_message_pieces_async(prompt_ids=piece_ids):
         return message
 
     conversation_id = next(
@@ -369,7 +484,7 @@ def store_message(message: Message) -> Message:
         if not piece.conversation_id:
             piece.conversation_id = conversation_id
 
-    memory.add_message_to_memory(request=message)
+    await memory.add_message_to_memory_async(request=message)
     return message
 
 

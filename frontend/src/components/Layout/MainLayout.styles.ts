@@ -146,18 +146,16 @@ export const useMainLayoutStyles = makeStyles({
       flexWrap: 'wrap',
     },
   },
-  labelsTitle: {
-    flexShrink: 0,
-    [NARROW_VIEWPORT_QUERY]: {
-      flexBasis: '100%',
-    },
-  },
-  labelsHint: {
-    color: tokens.colorNeutralForeground2,
-  },
   toolbarSlot: {
+    display: 'flex',
+    alignItems: 'center',
+    flexShrink: 0,
+    minWidth: 0,
+    minHeight: '48px',
     maxWidth: '100%',
-    marginLeft: 'auto',
+    padding: `${tokens.spacingVerticalXS} ${tokens.spacingHorizontalL}`,
+    borderBottom: `1px solid ${tokens.colorNeutralStroke1}`,
+    backgroundColor: tokens.colorNeutralBackground3,
     ':empty': {
       display: 'none',
     },

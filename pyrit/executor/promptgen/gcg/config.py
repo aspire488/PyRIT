@@ -41,7 +41,7 @@ def _default_model_kwargs() -> dict[str, Any]:
 
 
 def _default_tokenizer_kwargs() -> dict[str, Any]:
-    return {"use_fast": False}
+    return {"use_fast": True}
 
 
 @dataclass
@@ -58,9 +58,8 @@ class GCGModelConfig:
             ``AutoModelForCausalLM.from_pretrained``. Defaults to
             ``{"low_cpu_mem_usage": True, "use_cache": False}``.
         tokenizer_kwargs (dict[str, Any]): Extra keyword arguments forwarded to
-            ``AutoTokenizer.from_pretrained``. Defaults to ``{"use_fast": False}``
-            because several legacy chat tokenizers (Llama-2, Vicuna) ship slow
-            tokenizers only.
+            ``AutoTokenizer.from_pretrained``. Defaults to ``{"use_fast": True}``
+            because GCG needs the character offsets only fast tokenizers provide.
     """
 
     name: str
@@ -185,6 +184,9 @@ class GCGAlgorithmConfig:
             Defaults to False.
         filter_cand (bool): Drop candidates whose token-length changes after
             re-tokenization. Defaults to True.
+        use_prefix_cache (bool): Cache the invariant prompt prefix while
+            scoring candidate suffixes. Defaults to False because reduced-
+            precision cache reuse can introduce small numerical differences.
         random_seed (int): Seed for ``torch``/``numpy``/``random``. Defaults to 42.
         control_init (str): Initial suffix string the optimization starts from.
             Defaults to twenty space-separated ``!`` tokens.
@@ -212,6 +214,7 @@ class GCGAlgorithmConfig:
     learning_rate: float = 0.01
     allow_non_ascii: bool = False
     filter_cand: bool = True
+    use_prefix_cache: bool = False
     random_seed: int = 42
     control_init: str = _DEFAULT_CONTROL_INIT
     sampling: SamplingStrategy | None = None

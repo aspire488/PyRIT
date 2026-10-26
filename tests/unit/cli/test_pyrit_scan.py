@@ -8,13 +8,16 @@ Unit tests for the pyrit_scan CLI module (thin REST client).
 import logging
 from argparse import Namespace
 from datetime import UTC
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
 from pyrit.cli import _config_reader as pyrit_scan_config_reader
 from pyrit.cli import pyrit_scan
-from pyrit.models import Parameter
+from pyrit.cli._cli_args import parse_run_arguments
+from pyrit.models import Operation, Parameter
 from unit.mocks import make_scenario_result
 
 # A valid UTF-8 initializer whose text is not pure ASCII. Decoded with a Windows ANSI code page
@@ -23,6 +26,26 @@ UTF8_INITIALIZER_SOURCE = (
     "from pyrit.setup.pyrit_initializer import PyRITInitializer\n"
     'SYSTEM_PROMPT = "Réponds en français, café. 日本語でも回答してください。"\n'
 )
+
+
+def test_run_operation_id_reaches_typed_request() -> None:
+    operation_id = uuid4()
+    parsed = pyrit_scan._build_parser().parse_args(
+        ["run", "test", "--target", "target", "--operation-id", str(operation_id)]
+    )
+    request = pyrit_scan._build_run_request(parsed_args=parsed, scenario_name="test")
+    assert request.operation_id == operation_id
+    assert request.labels is None
+
+
+async def test_list_operations_prints_names_and_ids_async(capsys) -> None:
+    operation = Operation(name="Directory")
+    client = MagicMock(list_operations_async=AsyncMock(return_value=[operation]))
+    parsed = pyrit_scan._build_parser().parse_args(["list-operations"])
+    assert await pyrit_scan._handle_list_commands_async(client=client, parsed_args=parsed) == 0
+    output = capsys.readouterr().out
+    assert operation.name in output
+    assert str(operation.id) in output
 
 
 def _sp(*, name, description="", default=None, param_type="str", choices=None, is_list=False) -> Parameter:
@@ -37,6 +60,33 @@ def _sp(*, name, description="", default=None, param_type="str", choices=None, i
             "is_list": is_list,
         }
     )
+
+
+@pytest.mark.parametrize("stage", ["entry", "poll"])
+def test_compatibility_failure_exits_without_replay(stage, capsys):
+    from pyrit.cli.api_client import CompatibilityError
+
+    client = _mock_api_client()
+    if stage == "entry":
+        client.__aenter__.side_effect = CompatibilityError("Wrong build")
+    else:
+        client.get_scenario_run_async.side_effect = CompatibilityError("Backend changed")
+    with (
+        patch("pyrit.cli.api_client.PyRITApiClient", return_value=client),
+        patch("pyrit.cli._server_launcher.ServerLauncher.probe_health_async", AsyncMock(return_value=True)),
+    ):
+        assert pyrit_scan.main(["run", "test_scenario", "--target", "t"]) == 1
+    output = capsys.readouterr().out
+    assert "CompatibilityError" in output
+    assert "same PyRIT build" in output
+    assert "No request was automatically replayed" in output
+    client.cancel_scenario_run_async.assert_not_awaited()
+    if stage == "entry":
+        client.start_scenario_run_async.assert_not_awaited()
+    else:
+        client.start_scenario_run_async.assert_awaited_once()
+        client.get_scenario_run_async.assert_awaited_once()
+        assert "server run may still be active" in output
 
 
 def test_dataset_filter_help_covers_every_request_model_key():
@@ -395,6 +445,7 @@ def _mock_api_client():
         all_techniques=[],
         default_datasets=[],
         supported_parameters=[],
+        supported_parameter_names=[],
     )
     client.start_scenario_run_async.return_value = ScenarioRunSummary(
         scenario_result_id="test-id-123",
@@ -777,6 +828,19 @@ class TestAddScenarioParamsFromApi:
 class TestBuildRunRequest:
     """Tests for _build_run_request."""
 
+    @pytest.mark.parametrize("value", [None, "default", "all", "7", ""])
+    def test_limit_presence_matches_shell_parser(self, value: str | None) -> None:
+        flags = [] if value is None else ["--max-dataset-size", value]
+        parsed = pyrit_scan.parse_args(["run", "test", "--target", "target", *flags])
+        request = pyrit_scan._build_run_request(parsed_args=parsed, scenario_name="test")
+        shell_args = parse_run_arguments(
+            args_string="test --target target " + ("--max-dataset-size ''" if value == "" else " ".join(flags))
+        )
+        assert ("max_dataset_size" in request.model_fields_set) == (value is not None)
+        assert ("max_dataset_size" in shell_args) == (value is not None)
+        expected = 7 if value == "7" else value or "default"
+        assert request.max_dataset_size == shell_args.get("max_dataset_size", "default") == expected
+
     def test_includes_initializer_args(self):
         parsed = Namespace(
             target="t",
@@ -1106,6 +1170,24 @@ class TestResolveConfiguredServerUrl:
 class TestScenarioParamCoercion:
     """Regression tests for client-side coercion of typed scenario-declared params."""
 
+    @pytest.mark.parametrize("policy", ["skip", "raise"])
+    def test_compatibility_policy_flag_uses_api_enum_choices(self, policy: str) -> None:
+        from argparse import ArgumentParser
+
+        from pyrit.scenario import Scenario
+
+        parameter = next(p for p in Scenario.supported_parameters() if p.name == "incompatible_technique_policy")
+        api_parameter = Parameter.model_validate(parameter.model_dump(mode="json"))
+        assert api_parameter.choices == ["skip", "raise"]
+        parser = ArgumentParser()
+        pyrit_scan._add_scenario_params_from_api(parser=parser, params=[api_parameter])
+
+        parsed = parser.parse_args(["--incompatible-technique-policy", policy])
+
+        assert parsed.scenario__incompatible_technique_policy == policy
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--incompatible-technique-policy", "adapt"])
+
     def test_list_param_uses_nargs_plus(self):
         from argparse import ArgumentParser
 
@@ -1229,6 +1311,7 @@ class TestMainExtraPaths:
         mock_client.list_scenarios_async.return_value = [
             RegisteredScenario(
                 scenario_name="alt_a",
+                supported_parameter_names=[],
                 scenario_type="X",
                 description="",
                 default_technique="",
@@ -1238,6 +1321,7 @@ class TestMainExtraPaths:
             ),
             RegisteredScenario(
                 scenario_name="alt_b",
+                supported_parameter_names=[],
                 scenario_type="X",
                 description="",
                 default_technique="",
@@ -1534,6 +1618,52 @@ class TestScenarioResults:
         client.get_scenario_run_results_async.assert_awaited_once_with(scenario_result_id="SID")
         mock_print.assert_awaited_once()
 
+    def test_handle_results_json_output_writes_file(self, tmp_path):
+        import asyncio
+        import json
+
+        out = tmp_path / "out.json"
+        client = AsyncMock()
+        client.get_scenario_run_results_async.return_value = _make_scenario_result()
+        parsed = pyrit_scan.parse_args(["scenario-results", "SID", "--format", "json", "-o", str(out)])
+        rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
+        assert rc == 0
+        assert json.loads(out.read_text(encoding="utf-8"))["view"] == "overview"
+
+    def test_handle_results_pretty_output_file_errors(self, tmp_path, capsys):
+        import asyncio
+
+        out = tmp_path / "out.txt"
+        client = AsyncMock()
+        parsed = pyrit_scan.parse_args(["scenario-results", "SID", "--format", "pretty", "-o", str(out)])
+        rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
+        assert rc == 1
+        assert "requires --format json" in capsys.readouterr().out
+        assert not out.exists()
+
+    def test_handle_results_html_output_writes_report(self, tmp_path):
+        import asyncio
+
+        out = tmp_path / "report.html"
+        client = AsyncMock()
+        client.get_scenario_run_results_async.return_value = _make_scenario_result()
+        client.get_conversation_messages_async.return_value = {"messages": []}
+        parsed = pyrit_scan.parse_args(["scenario-results", "SID", "--format", "html", "-o", str(out)])
+        rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
+        assert rc == 0
+        text = out.read_text(encoding="utf-8")
+        assert "<!DOCTYPE html>" in text
+        assert "test_scenario" in text
+
+    def test_handle_results_html_without_output_errors(self, capsys):
+        import asyncio
+
+        client = AsyncMock()
+        parsed = pyrit_scan.parse_args(["scenario-results", "SID", "--format", "html"])
+        rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
+        assert rc == 1
+        assert "requires --output" in capsys.readouterr().out
+
     def test_handle_results_attacks_prints_table(self, capsys):
         import asyncio
 
@@ -1563,7 +1693,21 @@ class TestScenarioResults:
         assert "give me data" in out
         assert "Conversations" in out
 
-    def test_handle_results_full_prints_table_then_transcripts(self, capsys):
+    def test_handle_results_rejects_unknown_view_without_falling_back_to_conversations(self, capsys):
+        import asyncio
+
+        client = AsyncMock()
+        client.get_scenario_run_results_async.return_value = _make_scenario_result()
+        parsed = pyrit_scan.parse_args(["scenario-results", "SID"])
+        unknown_view: Any = "future_view"
+        parsed.view = unknown_view
+        with patch("pyrit.cli._output.print_conversations_async", new_callable=AsyncMock) as mock_conversations:
+            rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
+        assert rc == 1
+        assert "future_view" in capsys.readouterr().out
+        mock_conversations.assert_not_awaited()
+
+    def test_handle_results_full_prints_overview_then_transcripts(self, capsys):
         import asyncio
 
         client = AsyncMock()
@@ -1573,8 +1717,24 @@ class TestScenarioResults:
         rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
         assert rc == 0
         out = capsys.readouterr().out
-        assert "Attack Results" in out
+        assert "SCENARIO RESULTS" in out
         assert "Conversations" in out
+        assert "▼ Attack Results" not in out
+
+    def test_handle_results_full_json_stdout_stays_single_document(self, capsys):
+        import asyncio
+        import json
+
+        client = AsyncMock()
+        client.get_scenario_run_results_async.return_value = _make_scenario_result()
+        client.get_conversation_messages_async.return_value = {"messages": []}
+        # No --output and no --limit: the heavy-view notice fires, but must not corrupt stdout json.
+        parsed = pyrit_scan.parse_args(["scenario-results", "SID", "--view", "full", "--format", "json"])
+        rc = asyncio.run(pyrit_scan._handle_results_async(client=client, parsed_args=parsed))
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "at most 5" in captured.err  # advisory notice went to stderr
+        assert json.loads(captured.out)["view"] == "full"  # stdout is one valid json document
 
     def test_handle_results_conversations_reports_fetch_error(self, capsys):
         import asyncio
@@ -1648,6 +1808,7 @@ class TestScenarioParamFlow:
         client.list_scenarios_async.return_value = [
             RegisteredScenario(
                 scenario_name="foo",
+                supported_parameter_names=[],
                 scenario_type="X",
                 description="",
                 default_technique="",
@@ -1665,6 +1826,7 @@ class TestScenarioParamFlow:
             all_techniques=[],
             default_datasets=[],
             supported_parameters=typed_params,
+            supported_parameter_names=[parameter.name for parameter in typed_params],
         )
         client.start_scenario_run_async.return_value = ScenarioRunSummary(
             scenario_result_id="rid",

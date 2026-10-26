@@ -107,6 +107,25 @@ print(df.to_string(index=False))
 # accepts a `MessageTrueFalseScorer` or `MessageFloatScaleScorer` and builds a compatible
 # subclass that evaluates a whole conversation.
 #
+# ### Custom scorer migration
+#
+# Concrete judge constructors still accept `chat_target`. Generic `Scorer` and message-family
+# bases accept it with a deprecation warning until 1.4.0. This parameter only validates target
+# requirements; it does not store a target or create a judge. To migrate, remove the target
+# argument from the base call, initialize the message validator through the base, then compose
+# `TargetJudge(target=chat_target, requirements=self.TARGET_REQUIREMENTS)` at the concrete scorer.
+# Keep `_prompt_target` for `get_chat_target()` compatibility. Pass the effective expectation
+# in `JudgmentRequest` from `_score_piece_with_expectation_async`; keep prompt rendering and
+# verdict conversion in the scorer. Call `_capture_judgment_evidence` before sending a prepared
+# request. The request itself does not read ambient context. Raw sources do not receive criteria.
+#
+# **Hook migration is required:** a subclass of a migrated scorer that overrides only
+# `_score_piece_async` raises `TypeError` at construction, including for objective-only use.
+# Move that override and its `super()` call to `_score_piece_with_expectation_async`, and
+# forward the complete expectation. PyRIT does not silently bypass the old override or infer
+# how to combine both hooks. Legacy hooks on unmigrated leaves still work for objective-only
+# calls, but cannot accept other typed criteria.
+#
 # Generic family scorers consume a `Scorable` without assuming that it resolves to a
 # message. Message scorers also support message-specific entry points and policy. Generic
 # wrappers do not inherit those message APIs from their children; use their canonical
@@ -121,6 +140,13 @@ print(df.to_string(index=False))
 # storage and stores its SHA-256 digest. The score remains resolvable after the source file is
 # removed.
 #
+# `ConversationScorable(conversation_id=...)` names the whole current conversation.
+# Each acquisition records exact ordered piece IDs and digests in a conversation observation.
+# A fresh score can include new turns; an earlier snapshot cannot. The wrapper retains any child
+# judgment separately, with its rendered-content anchor. That child can replay its judgment
+# under the existing strict rules. A raw conversation snapshot alone does not make an arbitrary
+# wrapped scorer replayable.
+#
 # Target-backed scorers over text evidence also persist an `Observation` that references and hashes
 # the retained response in the SCORE conversation. The observation and its first score are
 # committed together. Capture requires durable scored evidence. A custom general-scorer template
@@ -134,7 +160,9 @@ print(df.to_string(index=False))
 # response-handler contract. `ScorerTargetResponsePayload` references the scorer's target response;
 # the target need not be a language model. Its kind is `scorer_target_response`.
 # Media observation capture remains deferred until its evidence can be snapshotted.
-# Trace-backed tool observations are covered in [Tool-call scoring](5_tool_call_scorer.ipynb).
+# Trace-backed tool observations are covered in [Tool-call scoring](5_tool_call_scorer.ipynb), and file-system
+# observations in [File-write scoring](6_file_write_scorer.ipynb), and sandboxed program runs in
+# [Program-execution scoring](7_program_execution_scorer.ipynb).
 #
 # Replaying a judgment is different from evaluating a stored run against a new expectation.
 # A retained target judgment answers the original expectation; changing that expectation
@@ -152,7 +180,7 @@ print(df.to_string(index=False))
 # setting that changes the judgment or parsing. Subclasses without their own declaration
 # can still capture observations, but replay raises `NonReplayableObservationError`.
 #
-# Deleting a score through `memory.get_session()` and ORM `session.delete()` removes its
+# Deleting a score through `await memory.get_session_async()` and ORM `await session.delete()` removes its
 # observation only after the final score reference is gone. Removing an ORM observation link
 # also triggers this cleanup, including when a collection is cleared before its score is deleted.
 # Cleanup uses persisted links and removed relationship history, not just cached collections.
@@ -160,12 +188,19 @@ print(df.to_string(index=False))
 # Bulk SQL deletes do not use this ORM cleanup path.
 #
 # Response helpers accept `expectation=`; their bare `objective=` input is deprecated until 2.0.
-# Objective and auxiliary scorers receive the complete expectation, with condition routing checked
-# across the group. Each scorer root keeps its own score/observation persistence boundary.
-# Direct scorers check required and duplicate criteria but ignore condition types they do not use.
-# Empty conditions retain legacy objective-only behavior and skip required-condition checks.
-# Data-bearing required conditions will need explicit validation before their scorer types are added.
-# Use a group helper, even with one scorer, when every condition must have a consumer.
+# Each scorer tree must support every condition it receives. Typed leaves require exactly one
+# condition of their declared type; constructor-configured leaves accept no conditions.
+# Composites validate coverage and send each child only its supported conditions, preserving
+# objective context. The child judgment records that subset; the composite verdict records the
+# complete expectation. Leaves cannot read sibling conditions.
+# Objective-only calls default to `MatchesObjective` when the scorer tree needs it. Other typed
+# criteria are never defaulted, and explicit nonempty condition lists are not extended.
+# In `MessageScorer.score_response_async`, the objective scorer alone owns required coverage.
+# Auxiliary scorers receive supported subsets; a typed auxiliary missing a required condition
+# is skipped as a whole. Constructor-configured diagnostics still run with objective context.
+# Errors from selected auxiliaries remain visible. Each root persists its own scores/observations.
+# Generic flat helpers require each root to accept the complete expectation independently.
+# Use an explicit composite when different judges jointly evaluate the supplied conditions.
 # `Scorer.score_with_scorers_async` accepts optional `scorer_roles`, one per scorer, for execution
 # context. Its result lists follow scorer input order, including empty lists.
 #
@@ -245,11 +280,11 @@ results = await AttackExecutor().execute_attack_async(  # type: ignore
 memory = CentralMemory.get_memory_instance()
 prompt_ids = []
 for r in results:
-    prompt_ids.extend(str(p.id) for p in memory.get_message_pieces(conversation_id=r.conversation_id))
+    prompt_ids.extend(str(p.id) for p in (await memory.get_message_pieces_async(conversation_id=r.conversation_id)))
 
 batch_scorer = BatchScorer()
 scores = await batch_scorer.score_responses_by_filters_async(scorer=scorer, prompt_ids=prompt_ids)  # type: ignore
 
 for score in scores:
-    text = memory.get_message_pieces(prompt_ids=[str(score.message_piece_id)])[0].original_value
+    text = (await memory.get_message_pieces_async(prompt_ids=[str(score.message_piece_id)]))[0].original_value
     print(f"{score.get_value()} : {text}")

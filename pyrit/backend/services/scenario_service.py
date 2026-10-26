@@ -13,15 +13,18 @@ from functools import lru_cache
 from time import monotonic
 
 from pyrit.backend.models.common import PaginationInfo
+from pyrit.backend.models.datasets import ScenarioDatasetLoadResponse
 from pyrit.backend.models.scenarios import ListRegisteredScenariosResponse
+from pyrit.backend.services.dataset_service import get_dataset_service
 from pyrit.backend.services.scenario_configuration_resolver import ScenarioConfigurationResolver
 from pyrit.models.catalog.scenario import (
     RegisteredScenario,
     ScenarioRunSizeEstimate,
     ScenarioRunSizeEstimateRequest,
 )
-from pyrit.registry import ScenarioMetadata, ScenarioRegistry
-from pyrit.scenario.core.dataset_configuration import read_only_dataset_resolution
+from pyrit.registry import AttackTechniqueRegistry, ScenarioMetadata, ScenarioRegistry
+from pyrit.registry.resolution import reject_non_external_params
+from pyrit.scenario.core import Scenario, override_default_adversarial_target
 
 logger = logging.getLogger(__name__)
 _ESTIMATE_CACHE_SIZE = 128
@@ -30,10 +33,10 @@ _CONFIGURED_ESTIMATE_CONCURRENCY = 4
 _DEFAULT_ESTIMATE_TIMEOUT_SECONDS = 3.0
 _ESTIMATE_INFLIGHT_SIZE = 256
 _UNAVAILABLE_CACHE_TTL_SECONDS = 30.0
-_EstimateCacheKey = tuple[str, int]
+_EstimateCacheKey = tuple[str, int, tuple[object, int]]
 _EstimateCacheValue = tuple[ScenarioRunSizeEstimate, float | None]
 _EstimateTask = asyncio.Task[ScenarioRunSizeEstimate]
-_ConfiguredEstimateKey = tuple[str, int, str]
+_ConfiguredEstimateKey = tuple[str, type[Scenario], str, tuple[object, int]]
 
 
 def _metadata_to_registered_scenario(
@@ -65,11 +68,20 @@ def _metadata_to_registered_scenario(
             aggregate: list(expansion) for aggregate, expansion in metadata.aggregate_technique_expansions
         },
         all_techniques=list(metadata.all_techniques),
+        max_concrete_techniques=metadata.max_concrete_techniques,
         technique_summaries=list(metadata.technique_summaries),
         default_datasets=list(metadata.default_datasets),
-        supported_parameters=list(metadata.supported_parameters),
+        dataset_options=metadata.dataset_options,
+        dataset_defaults=metadata.dataset_defaults,
+        supported_parameters=[
+            parameter.for_external_catalog()
+            for parameter in metadata.supported_parameters
+            if parameter.is_external_input
+        ],
+        supported_parameter_names=[parameter.name for parameter in metadata.supported_parameters],
         baseline_policy=metadata.baseline_policy,
         include_baseline_by_default=metadata.include_baseline_by_default,
+        uses_default_adversarial_target=metadata.uses_default_adversarial_target,
         default_run_size=estimate,
     )
 
@@ -88,6 +100,26 @@ class ScenarioService:
         self._configured_estimate_tasks: dict[_ConfiguredEstimateKey, _EstimateTask] = {}
         self._configured_estimate_task_lock = asyncio.Lock()
         self._configured_estimate_semaphore = asyncio.Semaphore(_CONFIGURED_ESTIMATE_CONCURRENCY)
+
+    def outstanding_estimates(self) -> int:
+        """Return the number of owned background estimates still running."""
+        tasks = {
+            *self._estimate_tasks.values(),
+            *self._configured_estimate_tasks.values(),
+            *self._timed_out_estimate_workers,
+        }
+        return sum(not task.done() for task in tasks)
+
+    async def close_async(self) -> None:
+        """Drain shielded estimates before discarding the registry and cache."""
+        tasks = {
+            *self._estimate_tasks.values(),
+            *self._configured_estimate_tasks.values(),
+            *self._timed_out_estimate_workers,
+        }
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._estimate_cache.clear()
 
     async def list_scenarios_async(
         self,
@@ -167,11 +199,20 @@ class ScenarioService:
         Returns:
             ScenarioRunSizeEstimate | None: Estimate, or ``None`` when the scenario is unknown.
         """
-        metadata = self._registry.get_registered_class_metadata(scenario_name)
-        if metadata is None:
+        try:
+            scenario_class = self._registry.get_class(scenario_name)
+        except KeyError:
             return None
+        if request.scenario_params:
+            reject_non_external_params(
+                params=request.scenario_params,
+                declared=scenario_class.supported_parameters(),
+                owner=scenario_name,
+            )
 
-        estimate_key = self._build_configured_estimate_key(metadata=metadata, request=request)
+        estimate_key = self._build_configured_estimate_key(
+            scenario_name=scenario_name, scenario_class=scenario_class, request=request
+        )
         task_lock = getattr(self, "_configured_estimate_task_lock", None)
         if task_lock is None:
             task_lock = asyncio.Lock()
@@ -201,9 +242,54 @@ class ScenarioService:
         assert isinstance(estimate, ScenarioRunSizeEstimate)
         return estimate
 
+    async def load_datasets_async(
+        self, *, scenario_name: str, request: ScenarioRunSizeEstimateRequest
+    ) -> ScenarioDatasetLoadResponse | None:
+        """
+        Resolve the same source selection as launch and load only its missing datasets.
+
+        Returns:
+            ScenarioDatasetLoadResponse | None: Selected metadata, or None for an unknown scenario.
+        """
+        try:
+            scenario_class = self._registry.get_class(scenario_name)
+        except KeyError:
+            return None
+        reject_non_external_params(
+            params=request.scenario_params or {},
+            declared=scenario_class.supported_parameters(),
+            owner=scenario_name,
+        )
+        resolver = ScenarioConfigurationResolver()
+        adversarial_target = resolver.resolve_adversarial_target(target_name=request.adversarial_target_name)
+        objective_target = resolver.resolve_target(target_name=request.target_name) if request.target_name else None
+        with override_default_adversarial_target(adversarial_target):
+            kwargs = await asyncio.to_thread(
+                resolver.resolve_configuration,
+                scenario_name=scenario_name,
+                scenario_class=scenario_class,
+                techniques=request.techniques,
+                technique_override=request.technique_override,
+                datasets=request.dataset_request,
+                objective_target=objective_target,
+                include_baseline=request.include_baseline,
+            )
+            scenario = await asyncio.to_thread(self._registry.create_instance, scenario_name)
+            scenario.set_params_from_args(args={**(request.scenario_params or {}), **kwargs})
+            settings = await scenario.load_datasets_async()
+        metadata = await get_dataset_service().list_datasets_async()
+        names = {source.name for source in settings.sources}
+        return ScenarioDatasetLoadResponse(
+            settings=settings, items=[item for item in metadata.items if item.name in names]
+        )
+
     async def _get_default_run_size_estimate_async(self, *, metadata: ScenarioMetadata) -> ScenarioRunSizeEstimate:
         """Return a cached, cancellation-safe scenario-owned estimate."""
-        cache_key = (metadata.registry_name, metadata.scenario_version)
+        cache_key = (
+            metadata.registry_name,
+            metadata.scenario_version,
+            AttackTechniqueRegistry.get_registry_singleton().catalog_revision,
+        )
         cache = getattr(self, "_estimate_cache", None)
         if cache is None:
             cache = OrderedDict()
@@ -383,8 +469,7 @@ class ScenarioService:
             construction_complete.set()
         if execution_timed_out.is_set():
             raise asyncio.CancelledError
-        with read_only_dataset_resolution():
-            return await scenario.get_default_run_size_estimate_async()
+        return await scenario.get_default_run_size_estimate_async()
 
     def _clear_estimate_task(self, *, task: _EstimateTask, cache_key: _EstimateCacheKey) -> None:
         """Remove a completed single-flight task without disturbing a replacement."""
@@ -457,21 +542,23 @@ class ScenarioService:
         scenario_class = self._registry.get_class(scenario_name)
         resolver = ScenarioConfigurationResolver()
         objective_target = resolver.resolve_target(target_name=request.target_name) if request.target_name else None
-        estimate_kwargs = resolver.resolve_configuration(
-            scenario_name=scenario_name,
-            scenario_class=scenario_class,
-            objective_target=objective_target,
-            techniques=request.techniques,
-            dataset_names=request.dataset_names,
-            max_dataset_size=request.max_dataset_size,
-            dataset_filters=request.dataset_filters,
-            include_baseline=request.include_baseline,
-        )
-        return await self._registry.create_and_estimate_async(
-            name=scenario_name,
-            scenario_params=request.scenario_params or {},
-            **estimate_kwargs,
-        )
+        adversarial_target = resolver.resolve_adversarial_target(target_name=request.adversarial_target_name)
+        with override_default_adversarial_target(adversarial_target):
+            estimate_kwargs = await asyncio.to_thread(
+                resolver.resolve_configuration,
+                scenario_name=scenario_name,
+                scenario_class=scenario_class,
+                objective_target=objective_target,
+                techniques=request.techniques,
+                technique_override=request.technique_override,
+                datasets=request.dataset_request,
+                include_baseline=request.include_baseline,
+            )
+            return await self._registry.create_and_estimate_async(
+                name=scenario_name,
+                scenario_params=request.scenario_params or {},
+                **estimate_kwargs,
+            )
 
     @staticmethod
     def _paginate(
@@ -499,7 +586,8 @@ class ScenarioService:
     @staticmethod
     def _build_configured_estimate_key(
         *,
-        metadata: ScenarioMetadata,
+        scenario_name: str,
+        scenario_class: type[Scenario],
         request: ScenarioRunSizeEstimateRequest,
     ) -> _ConfiguredEstimateKey:
         """
@@ -513,7 +601,12 @@ class ScenarioService:
             sort_keys=True,
             separators=(",", ":"),
         )
-        return metadata.registry_name, metadata.scenario_version, request_json
+        return (
+            scenario_name,
+            scenario_class,
+            request_json,
+            AttackTechniqueRegistry.get_registry_singleton().catalog_revision,
+        )
 
 
 @lru_cache(maxsize=1)

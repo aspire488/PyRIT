@@ -64,8 +64,15 @@ const SCENARIO: RegisteredScenario = {
   default_datasets: ['harmbench'],
   baseline_policy: 'enabled',
   include_baseline_by_default: true,
+  uses_default_adversarial_target: true,
   supported_parameters: [],
+  supported_parameter_names: [
+    'objective_target', 'scenario_techniques', 'dataset_config', 'memory_labels',
+    'max_concurrency', 'max_retries', 'include_baseline',
+  ],
   default_run_size: {
+    dataset_size: { kind: 'bounded', value: 1 },
+    dataset_limit: { state: 'scenario_default' },
     estimated_attack_count: 2,
     components: [],
     datasets: [],
@@ -82,6 +89,8 @@ const TARGET: TargetInstance = {
 }
 
 const ESTIMATE: ScenarioRunSizeEstimateResponse = {
+  dataset_size: { kind: 'bounded', value: 1 },
+  dataset_limit: { state: 'scenario_default' },
   estimated_attack_count: 2,
   components: [{
     label: 'Configured attacks',
@@ -145,8 +154,11 @@ function renderFlow(): void {
             path="/scanner/:scenarioName"
             element={(
               <ScenarioDetail
-                activeTarget={null}
+                targets={[TARGET]}
+                defaultObjectiveTarget={TARGET}
+                defaultAdversarialTarget={null}
                 labels={{ operator: 'integration-test' }}
+                defaultsReady
                 onNavigate={jest.fn()}
               />
             )}
@@ -166,10 +178,6 @@ describe('Scenario catalog-to-run integration', () => {
       pagination: { limit: 200, has_more: false },
     })
     mockGetScenario.mockResolvedValue(SCENARIO)
-    mockListTargets.mockResolvedValue({
-      items: [TARGET],
-      pagination: { limit: 200, has_more: false },
-    })
     mockEstimateRun.mockResolvedValue(ESTIMATE)
     mockStartRun.mockResolvedValue({ scenario_result_id: RUN_ID })
     mockUseScenarioRunProgress.mockReturnValue({
@@ -217,5 +225,6 @@ describe('Scenario catalog-to-run integration', () => {
       `/scanner-history/${RUN_ID}`,
     )
     expect(await screen.findByRole('heading', { level: 1, name: SCENARIO_NAME })).toBeInTheDocument()
+    expect(mockListTargets).not.toHaveBeenCalled()
   })
 })

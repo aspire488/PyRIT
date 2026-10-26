@@ -100,6 +100,13 @@ describe("conversationExport", () => {
     jest.restoreAllMocks();
   });
 
+  it("preserves the synthetic tool label in exported conversations", async () => {
+    const messages = [message({ role: "simulated_tool", content: "Injected tool result" })];
+    expect(conversationToMarkdown(messages, "conv-1", FIXED_NOW)).toContain("Simulated Tool");
+    expect(await conversationToHtml(messages, "conv-1", FIXED_NOW)).toContain("Simulated Tool");
+    expect(conversationToJson(messages, "conv-1")).toContain("simulated_tool");
+  });
+
   describe("conversationToMarkdown", () => {
     it("renders a header with the conversation id, exported time, and message count", () => {
       const md = conversationToMarkdown([message()], "conv-1", FIXED_NOW);
@@ -342,7 +349,7 @@ describe("conversationExport", () => {
       expect(exportedMessage.displayPieces[0].scores[0].id).toBe("score-blocked");
     });
 
-    it("exports persisted processing-error scores without diagnostic values", () => {
+    it("exports persisted processing-error details and scores without editable diagnostic content", () => {
       const backendMessage: BackendMessage = {
         turn_number: 1,
         role: "assistant",
@@ -384,7 +391,13 @@ describe("conversationExport", () => {
           ],
         }),
       ]);
-      expect(json).not.toMatch(/Internal original diagnostic|Traceback/);
+      expect(exportedMessage.content).toBe("");
+      expect(exportedMessage).not.toHaveProperty("originalContent");
+      expect(exportedMessage.error).toEqual({
+        type: "processing",
+        description: backendMessage.message_pieces[0].converted_value,
+      });
+      expect(json).not.toContain("Internal original diagnostic");
     });
 
     it("defaults the export timestamp to a valid ISO string when omitted", () => {

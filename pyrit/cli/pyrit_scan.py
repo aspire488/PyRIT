@@ -18,7 +18,8 @@ import math
 import sys
 from argparse import ArgumentParser, Namespace, RawDescriptionHelpFormatter
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast, get_args, get_origin
+from typing import TYPE_CHECKING, Any, assert_never, cast, get_args, get_origin
+from uuid import UUID
 
 import aiofiles
 
@@ -27,10 +28,12 @@ from pyrit.cli._cli_args import (
     ARG_HELP,
     _parse_initializer_arg,
     add_results_arguments,
+    build_dataset_request_fields,
     build_parameters_from_api,
-    collapse_dataset_filters,
     non_negative_int,
     parse_dataset_filter,
+    parse_dataset_limit,
+    parse_dataset_source,
     positive_int,
     validate_log_level_argparse,
 )
@@ -310,8 +313,24 @@ def _add_run_arguments(*, parser: ArgumentParser, scenario_params: list[Paramete
     parser.add_argument("--max-concurrency", type=positive_int, help=ARG_HELP["max_concurrency"])
     parser.add_argument("--max-retries", type=non_negative_int, help=ARG_HELP["max_retries"])
     parser.add_argument("--memory-labels", type=str, help=ARG_HELP["memory_labels"])
+    parser.add_argument("--operation-id", type=UUID, help="Saved Operation UUID (see list-operations)")
     parser.add_argument("--dataset-names", type=str, nargs="+", help=ARG_HELP["dataset_names"])
-    parser.add_argument("--max-dataset-size", type=positive_int, help=ARG_HELP["max_dataset_size"])
+    parser.add_argument("--max-dataset-size", type=parse_dataset_limit, help=ARG_HELP["max_dataset_size"])
+    parser.add_argument(
+        "--datasets",
+        type=parse_dataset_source,
+        nargs="+",
+        help="Ordered dataset names with optional :N or :all source caps",
+    )
+    parser.add_argument(
+        "--max-per-dataset", type=parse_dataset_limit, help="Default source cap; use all for no source cap"
+    )
+    parser.add_argument("--max-total", type=parse_dataset_limit, help="Combined attack-group cap")
+    parser.add_argument(
+        "--dataset-fetch",
+        choices=["never", "if_missing", "always"],
+        help="Dataset preparation policy; omission keeps scenario settings. always replaces stored data.",
+    )
     parser.add_argument(
         "--dataset-filters",
         type=parse_dataset_filter,
@@ -330,6 +349,7 @@ _LIST_VERBS: dict[str, str] = {
     "list-targets": "List all available targets",
     "list-converters": "List all registered converter instances",
     "list-datasets": "List all available datasets",
+    "list-operations": "List saved Operations and their UUIDs",
 }
 
 
@@ -795,6 +815,8 @@ async def _handle_list_commands_async(*, client: Any, parsed_args: Namespace) ->
         _output.print_initializer_list(items=await client.list_initializers_async())
     elif command == "list-targets":
         _output.print_target_list(items=await client.list_targets_async())
+    elif command == "list-operations":
+        _output.print_operation_list(items=await client.list_operations_async())
     elif command == "list-datasets":
         resp = await client.list_datasets_async()
         _output.print_dataset_list(items=resp.get("items", []))
@@ -843,13 +865,29 @@ async def _handle_results_async(*, client: Any, parsed_args: Namespace) -> int:
     from pyrit.cli._cli_args import ScenarioResultView
     from pyrit.cli._results import (
         apply_view_limit_policy,
+        resolve_output_sink,
         resolve_view,
+        warn_if_view_ignored_by_html,
     )
     from pyrit.output import output_scenario_attacks_async
 
     scenario_result_id = parsed_args.scenario_result_id
     view = resolve_view(view=parsed_args.view)
-    limit = apply_view_limit_policy(view=view, limit=parsed_args.limit, attack_result_ids=parsed_args.attack_result_ids)
+    fmt = parsed_args.format
+    # html always renders a complete report and ignores the default heavy-view cap,
+    # so skip the limit policy (and its warning) for it.
+    if fmt == "html":
+        warn_if_view_ignored_by_html(view=parsed_args.view)
+        limit = parsed_args.limit
+    else:
+        limit = apply_view_limit_policy(
+            view=view, limit=parsed_args.limit, attack_result_ids=parsed_args.attack_result_ids
+        )
+    try:
+        sink = resolve_output_sink(output_path=parsed_args.output, output_format=fmt)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     try:
         result = await client.get_scenario_run_results_async(scenario_result_id=scenario_result_id)
@@ -857,27 +895,51 @@ async def _handle_results_async(*, client: Any, parsed_args: Namespace) -> int:
         _print_cli_exception(exc=exc)
         return 1
 
-    if view is ScenarioResultView.OVERVIEW:
-        await _output.print_scenario_result_async(result=result)
-        return 0
-
-    if view in (ScenarioResultView.ATTACKS, ScenarioResultView.FULL):
-        await output_scenario_attacks_async(
-            result,
-            attack_result_ids=parsed_args.attack_result_ids,
-            limit=limit,
-        )
-        if view is ScenarioResultView.ATTACKS:
-            return 0
-
     try:
-        await _output.print_conversations_async(
-            result=result,
-            client=client,
-            scenario_result_id=scenario_result_id,
-            attack_result_ids=parsed_args.attack_result_ids,
-            limit=limit,
-        )
+        if fmt == "html":
+            # html is always the full report regardless of --view; a file report should be
+            # complete, so honor only an explicit --limit (no default heavy-view cap).
+            await _output.print_full_async(
+                result=result,
+                client=client,
+                scenario_result_id=scenario_result_id,
+                format="html",
+                sink=sink,
+                attack_result_ids=parsed_args.attack_result_ids,
+                limit=parsed_args.limit,
+            )
+        elif view is ScenarioResultView.OVERVIEW:
+            await _output.print_scenario_result_async(result=result, format=fmt, sink=sink)
+        elif view is ScenarioResultView.ATTACKS:
+            await output_scenario_attacks_async(
+                result,
+                attack_result_ids=parsed_args.attack_result_ids,
+                limit=limit,
+                format=fmt,
+                sink=sink,
+            )
+        elif view is ScenarioResultView.FULL:
+            await _output.print_full_async(
+                result=result,
+                client=client,
+                scenario_result_id=scenario_result_id,
+                format=fmt,
+                sink=sink,
+                attack_result_ids=parsed_args.attack_result_ids,
+                limit=limit,
+            )
+        elif view is ScenarioResultView.CONVERSATIONS:
+            await _output.print_conversations_async(
+                result=result,
+                client=client,
+                scenario_result_id=scenario_result_id,
+                format=fmt,
+                sink=sink,
+                attack_result_ids=parsed_args.attack_result_ids,
+                limit=limit,
+            )
+        else:
+            assert_never(view)
     except Exception as exc:
         _print_cli_exception(exc=exc)
         return 1
@@ -965,14 +1027,11 @@ def _build_run_request(*, parsed_args: Namespace, scenario_name: str) -> RunScen
         kwargs["max_concurrency"] = parsed_args.max_concurrency
     if parsed_args.max_retries is not None:
         kwargs["max_retries"] = parsed_args.max_retries
-    if parsed_args.dataset_names:
-        kwargs["dataset_names"] = parsed_args.dataset_names
-    if parsed_args.max_dataset_size is not None:
-        kwargs["max_dataset_size"] = parsed_args.max_dataset_size
-    if parsed_args.dataset_filters:
-        kwargs["dataset_filters"] = collapse_dataset_filters(parsed_args.dataset_filters)
+    kwargs.update(build_dataset_request_fields(vars(parsed_args)))
     if parsed_args.memory_labels:
         kwargs["labels"] = parse_memory_labels(json_string=parsed_args.memory_labels)
+    if getattr(parsed_args, "operation_id", None) is not None:
+        kwargs["operation_id"] = parsed_args.operation_id
 
     scenario_params = _extract_scenario_args(parsed=parsed_args)
     if scenario_params:
@@ -1019,10 +1078,15 @@ async def _run_scenario_async(
         int: Exit code (``0`` if the run completed successfully, ``1`` otherwise).
     """
     from pyrit.cli import _output
+    from pyrit.cli.api_client import CompatibilityError
     from pyrit.models import ScenarioRunState
 
     scenario_name = parsed_args.scenario_name
-    request = _build_run_request(parsed_args=parsed_args, scenario_name=scenario_name)
+    try:
+        request = _build_run_request(parsed_args=parsed_args, scenario_name=scenario_name)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     print(f"\nRunning scenario: {scenario_name}")
     sys.stdout.flush()
@@ -1055,6 +1119,11 @@ async def _run_scenario_async(
             print("Scenario run cancelled.")
         except Exception:
             print("Warning: could not cancel scenario run on server.")
+        return 1
+
+    except CompatibilityError as exc:
+        _print_cli_exception(exc=exc)
+        print("Polling stopped; the server run may still be active.")
         return 1
 
     if run.status == ScenarioRunState.COMPLETED:

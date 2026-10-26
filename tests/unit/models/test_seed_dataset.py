@@ -2,6 +2,7 @@
 # Licensed under the MIT license.
 
 import uuid
+from typing import assert_type
 
 import pytest
 
@@ -139,6 +140,41 @@ def test_seed_dataset_get_random_values_more_than_available():
     assert len(result) == 2
 
 
+def test_seed_dataset_get_random_values_zero_returns_empty():
+    ds = SeedDataset(seeds=[{"value": "a"}, {"value": "b"}])
+    assert ds.get_random_values(number=0) == []
+
+
+@pytest.mark.parametrize("number", [-1, True, 1.5, "2"])
+def test_seed_dataset_get_random_values_rejects_invalid_number(number):
+    ds = SeedDataset(seeds=[{"value": "a"}, {"value": "b"}])
+    with pytest.raises(ValueError, match="number must be a non-negative integer"):
+        ds.get_random_values(number=number)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "name"),
+    [
+        ({"first": -2}, "first"),
+        ({"last": -2}, "last"),
+        ({"first": 2, "last": -1}, "last"),
+        ({"first": True}, "first"),
+        ({"last": 1.5}, "last"),
+    ],
+)
+def test_seed_dataset_get_values_rejects_invalid_counts(kwargs, name):
+    ds = SeedDataset(seeds=[{"value": f"p{i}"} for i in range(6)])
+    with pytest.raises(ValueError, match=f"{name} must be a non-negative integer"):
+        ds.get_values(**kwargs)
+
+
+def test_seed_dataset_get_values_accepts_zero_counts():
+    ds = SeedDataset(seeds=[{"value": f"p{i}"} for i in range(6)])
+    assert ds.get_values(first=0) == []
+    assert ds.get_values(last=0) == []
+    assert ds.get_values(first=2, last=0) == ["p0", "p1"]
+
+
 def test_seed_dataset_prompts_property():
     ds = SeedDataset(seeds=[{"value": "p1"}, {"value": "obj", "seed_type": "objective"}])
     assert len(ds.prompts) == 1
@@ -195,3 +231,14 @@ def test_seed_dataset_group_without_group_id():
 def test_seed_dataset_group_rejects_unsupported_seed_type():
     with pytest.raises(ValueError, match="Unsupported seed type: Seed"):
         SeedDataset.group_seed_prompts_by_prompt_group_id([Seed(value="unsupported")])
+
+
+def test_seed_dataset_from_dict_preserves_subclass_type():
+    class CustomSeedDataset(SeedDataset):
+        pass
+
+    ds = CustomSeedDataset.from_dict({"seeds": [{"value": "hello"}]})
+
+    assert_type(ds, CustomSeedDataset)
+    assert type(ds) is CustomSeedDataset
+    assert isinstance(ds.seeds[0], SeedPrompt)

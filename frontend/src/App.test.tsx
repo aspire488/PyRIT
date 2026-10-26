@@ -3,16 +3,35 @@
  * Licensed under the MIT license.
  */
 
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { Suspense } from "react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation, useNavigate } from "react-router";
 import App from "./App";
-import { ThemeProvider } from "./hooks/useTheme";
 
-import { attacksApi, targetsApi } from "./services/api";
+import { attacksApi, operationsApi, targetsApi } from "./services/api";
 import { makeTarget } from "./test-utils/targetFixtures";
+import { DEFAULT_USER_PREFERENCES, readUserPreferences, writeUserPreferences } from "./utils/userPreferences";
+import { DEFAULT_ANALYTICS_VIEW, analyticsViewToHash } from "./utils/attackAnalytics";
 
 const mockGetActiveAccount = jest.fn();
+let mockCreatedAttackRender: Promise<void> | null = null;
+
+jest.mock("./hooks/useTargetRegistry", () => ({
+  useTargetRegistry: () => {
+    const { useState } = jest.requireActual<typeof import("react")>("react");
+    const [targets, setTargets] = useState<import("./types").TargetInstance[]>([]);
+    return {
+      targets,
+      loading: false,
+      error: null,
+      refresh: jest.fn(),
+      rememberTarget: (target: import("./types").TargetInstance) => {
+        setTargets((current) => [...current, target]);
+      },
+    };
+  },
+}));
 
 // Mock react-joyride to prevent the guided tour from interfering with App tests.
 // The Joyride component is rendered as a no-op div, avoiding uncontrolled state
@@ -52,6 +71,9 @@ jest.mock("@azure/msal-react", () => ({
 }));
 
 jest.mock("./services/api", () => ({
+  runtimeApi: {
+    getReadiness: jest.fn().mockResolvedValue({ ready: true, state: 'ready', generation: '' }),
+  },
   attacksApi: {
     getAttack: jest.fn(),
     listAttacks: jest.fn(),
@@ -75,12 +97,16 @@ jest.mock("./services/api", () => ({
   authApi: {
     getAccess: jest.fn().mockResolvedValue({ isAdmin: true }),
   },
+  operationsApi: {
+    get: jest.fn(),
+  },
   setMsalInstance: jest.fn(),
 }));
 
 const mockedVersionApi = jest.requireMock("./services/api").versionApi;
 
 const mockGetAttack = attacksApi.getAttack as jest.Mock;
+const mockGetOperation = operationsApi.get as jest.Mock;
 const mockListTargets = targetsApi.listTargets as jest.Mock;
 const mockGetTarget = targetsApi.getTarget as jest.Mock;
 
@@ -91,7 +117,7 @@ jest.mock("./components/Labels/LabelsBar", () => {
   return {
     __esModule: true,
     default: MockLabelsBar,
-    DEFAULT_GLOBAL_LABELS: { operator: 'roakey', operation: 'op_trash_panda' },
+    DEFAULT_GLOBAL_LABELS: { operator: 'roakey' },
   };
 });
 
@@ -101,15 +127,29 @@ jest.mock("./components/Layout/MainLayout", () => {
     currentView,
     onNavigate,
     labels,
+    onLabelsChange,
+    operatorReadOnly,
   }: {
     children: React.ReactNode;
     currentView: string;
     onNavigate: (view: string) => void;
     labels: Record<string, string>;
+    onLabelsChange: (labels: Record<string, string>) => void;
+    operatorReadOnly: boolean;
   }) => {
     return (
       <div data-testid="main-layout" data-current-view={currentView}>
         <span data-testid="global-labels-json">{JSON.stringify(labels)}</span>
+        <span data-testid="home-labels-json">{JSON.stringify(labels)}</span>
+        <span data-testid="operator-read-only">{String(operatorReadOnly)}</span>
+        <button onClick={() => onLabelsChange({ ...labels, campaign: "op_edited", team: "red" })}>
+          Change run labels
+        </button>
+        <button onClick={() => onLabelsChange(Object.fromEntries(
+          Object.entries(labels).filter(([key]: [string, string]) => key !== "custom"),
+        ))}>
+          Remove custom label
+        </button>
         <button onClick={() => onNavigate("home")} data-testid="nav-home">
           Home
         </button>
@@ -122,8 +162,12 @@ jest.mock("./components/Layout/MainLayout", () => {
         <button onClick={() => onNavigate("history")} data-testid="nav-history">
           History
         </button>
+        <button onClick={() => onNavigate("analytics")}>Analytics</button>
         <button onClick={() => onNavigate("scenarios")} data-testid="nav-scenarios">
           Scenarios
+        </button>
+        <button onClick={() => onNavigate("datasets")} data-testid="nav-datasets">
+          Datasets
         </button>
         {children}
       </div>
@@ -153,6 +197,7 @@ jest.mock("./components/Chat/ChatWindow", () => {
     onSelectConversation,
     labels,
     scenarioResultId,
+    isLoadingAttack,
   }: {
     onNewAttack: () => void;
     activeTarget: unknown;
@@ -168,8 +213,12 @@ jest.mock("./components/Chat/ChatWindow", () => {
     onSelectConversation: (convId: string) => void;
     labels: Record<string, string>;
     scenarioResultId?: string | null;
+    isLoadingAttack?: boolean;
   }) => {
     const location = useLocation();
+    if (attackResultId === "ar-123" && mockCreatedAttackRender) {
+      throw mockCreatedAttackRender;
+    }
     return (
       <div data-testid="chat-window">
         <span data-testid="attack-result-id">{attackResultId ?? "none"}</span>
@@ -193,6 +242,7 @@ jest.mock("./components/Chat/ChatWindow", () => {
         <button
           onClick={() => onConversationCreated("ar-123", "conv-123")}
           data-testid="set-conversation"
+          disabled={isLoadingAttack}
         >
           Set Conv
         </button>
@@ -220,20 +270,20 @@ jest.mock("./components/Chat/ChatWindow", () => {
 jest.mock("./components/Config/TargetConfig", () => {
   const { makeTarget } = jest.requireActual("@/test-utils/targetFixtures") as typeof import("@/test-utils/targetFixtures");
   const MockTargetConfig = ({
-    activeTarget,
-    onSetActiveTarget,
+    defaultObjectiveTarget,
+    onSetDefaultObjectiveTarget,
   }: {
-    activeTarget: unknown;
-    onSetActiveTarget: (t: unknown) => void;
+    defaultObjectiveTarget: unknown;
+    onSetDefaultObjectiveTarget: (t: unknown) => void;
   }) => {
     return (
       <div data-testid="target-config">
         <span data-testid="active-target-name">
-          {(activeTarget as { target_registry_name?: string })?.target_registry_name ?? "none"}
+          {(defaultObjectiveTarget as { target_registry_name?: string })?.target_registry_name ?? "none"}
         </span>
         <button
           onClick={() =>
-            onSetActiveTarget(makeTarget({
+            onSetDefaultObjectiveTarget(makeTarget({
               target_registry_name: "test_target",
               target_type: "OpenAIChatTarget",
               identifier_hash: "test-target-hash",
@@ -257,6 +307,21 @@ jest.mock("./components/Configuration/Configuration", () => ({
   __esModule: true,
   default: () => <div data-testid="configuration">Configuration</div>,
 }));
+
+jest.mock("./components/Analytics/AnalyticsPage", () => {
+  const { useLocation } = jest.requireActual<typeof import("react-router")>("react-router");
+  function MockAnalyticsPage({ onOpenAttack }: { onOpenAttack: (id: string) => void }) {
+    const location = useLocation();
+    return <section aria-label="Analytics explorer">
+      <output aria-label="Analytics URL">{location.pathname}{location.search}{location.hash}</output>
+      <button onClick={() => onOpenAttack("analytics-result")}>Open analytics result</button>
+    </section>;
+  }
+  return {
+    __esModule: true,
+    default: MockAnalyticsPage,
+  };
+});
 
 jest.mock("./components/History/AttackHistory", () => {
   const MockAttackHistory = ({
@@ -345,6 +410,33 @@ jest.mock("./components/Home/Home", () => {
   };
 });
 
+jest.mock("./components/Datasets/DatasetCatalog", () => {
+  const MockDatasetCatalog = () => <div data-testid="dataset-catalog" />;
+  MockDatasetCatalog.displayName = "MockDatasetCatalog";
+  return {
+    __esModule: true,
+    default: MockDatasetCatalog,
+  };
+});
+
+jest.mock("./components/Datasets/DatasetSelection", () => {
+  const { useLocation } = jest.requireActual<typeof import("react-router")>("react-router");
+  const MockDatasetSelection = () => {
+    const location = useLocation();
+    return (
+      <div
+        data-testid="dataset-selection"
+        data-location={`${location.pathname}${location.search}`}
+      />
+    );
+  };
+  MockDatasetSelection.displayName = "MockDatasetSelection";
+  return {
+    __esModule: true,
+    default: MockDatasetSelection,
+  };
+});
+
 jest.mock("./components/Scenarios/ScenarioCatalog", () => {
   const MockScenarioCatalog = () => <div data-testid="scenario-catalog" />;
   MockScenarioCatalog.displayName = "MockScenarioCatalog";
@@ -354,19 +446,83 @@ jest.mock("./components/Scenarios/ScenarioCatalog", () => {
   };
 });
 
+jest.mock("./components/ScenarioPresets/ScenarioPresetLibrary", () => {
+  const MockScenarioPresetLibrary = ({
+    operationId,
+    defaultsReady,
+  }: {
+    operationId: string | null;
+    defaultsReady: boolean;
+  }) => (
+    <div
+      data-testid="scenario-preset-library"
+      data-operation-id={operationId ?? ""}
+      data-defaults-ready={String(defaultsReady)}
+    />
+  );
+  MockScenarioPresetLibrary.displayName = "MockScenarioPresetLibrary";
+  return {
+    __esModule: true,
+    default: MockScenarioPresetLibrary,
+  };
+});
+
+jest.mock("./components/ScenarioPresets/ScenarioPresetEditor", () => {
+  const { useParams } = jest.requireActual("react-router");
+  const MockScenarioPresetEditor = ({ mode }: { mode: string }) => {
+    const { presetName } = useParams();
+    return (
+      <div data-testid="scenario-preset-editor" data-mode={mode}>
+        {presetName ?? ""}
+      </div>
+    );
+  };
+  MockScenarioPresetEditor.displayName = "MockScenarioPresetEditor";
+  return {
+    __esModule: true,
+    default: MockScenarioPresetEditor,
+  };
+});
+
+jest.mock("./components/ScenarioSuites/ScenarioSuiteLibrary", () => {
+  const MockScenarioSuiteLibrary = () => <div data-testid="scenario-suite-library" />;
+  MockScenarioSuiteLibrary.displayName = "MockScenarioSuiteLibrary";
+  return {
+    __esModule: true,
+    default: MockScenarioSuiteLibrary,
+  };
+});
+
+jest.mock("./components/ScenarioSuites/ScenarioSuiteEditor", () => {
+  const { useParams } = jest.requireActual("react-router");
+  const MockScenarioSuiteEditor = ({ mode }: { mode: string }) => {
+    const { suiteName } = useParams();
+    return (
+      <div data-testid="scenario-suite-editor" data-mode={mode}>
+        {suiteName ?? ""}
+      </div>
+    );
+  };
+  MockScenarioSuiteEditor.displayName = "MockScenarioSuiteEditor";
+  return {
+    __esModule: true,
+    default: MockScenarioSuiteEditor,
+  };
+});
+
 jest.mock("./components/Scenarios/ScenarioDetail", () => {
   const MockScenarioDetail = ({
-    activeTarget,
+    defaultObjectiveTarget,
     labels,
     onNavigate,
   }: {
-    activeTarget: unknown;
+    defaultObjectiveTarget: unknown;
     labels: Record<string, string>;
     onNavigate: (view: string) => void;
   }) => {
     return (
       <div data-testid="scenario-detail">
-        <span data-testid="scenario-detail-has-target">{activeTarget ? "yes" : "no"}</span>
+        <span data-testid="scenario-detail-has-target">{defaultObjectiveTarget ? "yes" : "no"}</span>
         <span data-testid="scenario-detail-labels-json">{JSON.stringify(labels)}</span>
         <button onClick={() => onNavigate("registry")} data-testid="scenario-detail-go-config">
           Configure target
@@ -424,17 +580,17 @@ describe("App", () => {
   // initialPath lets a test deep-link straight to a view.
   function renderApp(initialPath = "/") {
     return render(
-      <ThemeProvider>
-        <MemoryRouter initialEntries={[initialPath]}>
-          <App />
-        </MemoryRouter>
-      </ThemeProvider>
+      <MemoryRouter initialEntries={[initialPath]}>
+        <App />
+      </MemoryRouter>
     );
   }
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockCreatedAttackRender = null;
     mockGetActiveAccount.mockReturnValue(null);
+    mockedVersionApi.getVersion.mockResolvedValue({ version: "1.0.0" });
     mockListTargets.mockResolvedValue({
       items: [],
       pagination: { limit: 200, has_more: false, next_cursor: null },
@@ -443,10 +599,92 @@ describe("App", () => {
     window.localStorage.clear();
   });
 
+  it("opens Analytics and restores its fragment after inspecting a saved attack", async () => {
+    const user = userEvent.setup();
+    const originalPath = `/analytics${analyticsViewToHash({
+      ...DEFAULT_ANALYTICS_VIEW,
+      filters: { ...DEFAULT_ANALYTICS_VIEW.filters, outcomes: ["failure"] },
+    })}`;
+    mockGetAttack.mockResolvedValue({
+      attack_result_id: "analytics-result", conversation_id: "synthetic-conversation",
+      objective: "Safe saved check", outcome: "failure", labels: {}, related_conversation_ids: [],
+    });
+    renderApp(originalPath);
+    expect(screen.getByTestId("main-layout")).toHaveAttribute("data-current-view", "analytics");
+    expect(screen.getByLabelText("Analytics URL")).toHaveTextContent(originalPath);
+    await user.click(screen.getByRole("button", { name: "Open analytics result" }));
+    await screen.findByTestId("chat-window");
+    await waitFor(() => expect(mockGetAttack).toHaveBeenCalledWith("analytics-result"));
+    await user.click(screen.getByRole("button", { name: "Analytics", exact: true }));
+    expect(screen.getByLabelText("Analytics URL")).toHaveTextContent(originalPath);
+  });
+
   it("renders with FluentProvider and MainLayout", () => {
     renderApp();
     expect(screen.getByTestId("main-layout")).toBeInTheDocument();
     expect(screen.getByTestId("home-view")).toBeInTheDocument();
+  });
+
+  it("keeps run labels account-scoped and derives the operator without saving it", async () => {
+    const user = userEvent.setup();
+    const alice = { homeAccountId: "alice-id", tenantId: "tenant", username: "Alice@example.com" };
+    const bob = { homeAccountId: "bob-id", tenantId: "tenant", username: "Bob@example.com" };
+    mockGetActiveAccount.mockReturnValue(alice);
+    const { rerender } = renderApp();
+    await user.click(screen.getByRole("button", { name: "Change run labels" }));
+    expect(readUserPreferences("tenant:alice-id").labels).toEqual({ campaign: "op_edited", team: "red" });
+    expect(screen.getByTestId("home-labels-json")).toHaveTextContent('"operator":"alice"');
+    expect(screen.getByTestId("operator-read-only")).toHaveTextContent("true");
+
+    mockGetActiveAccount.mockReturnValue(bob);
+    rerender(<MemoryRouter><App /></MemoryRouter>);
+    expect(screen.getByTestId("home-labels-json")).toHaveTextContent('"operator":"bob"');
+    expect(screen.getByTestId("home-labels-json")).not.toHaveTextContent("op_edited");
+    mockGetActiveAccount.mockReturnValue(alice);
+    rerender(<MemoryRouter><App /></MemoryRouter>);
+    expect(screen.getByTestId("home-labels-json")).toHaveTextContent('"campaign":"op_edited"');
+    expect(screen.getByTestId("home-labels-json")).toHaveTextContent('"team":"red"');
+  });
+
+  it("keeps edits and removed labels when backend defaults arrive after a reload", async () => {
+    const user = userEvent.setup();
+    mockedVersionApi.getVersion.mockResolvedValue({
+      version: "1.0.0",
+      default_labels: { custom: "backend", campaign: "op_backend" },
+    });
+    const first = renderApp();
+    await waitFor(() => expect(screen.getByTestId("home-labels-json")).toHaveTextContent('"custom":"backend"'));
+    await user.click(screen.getByRole("button", { name: "Remove custom label" }));
+    expect(readUserPreferences("local").labels).toEqual({ custom: null });
+    first.unmount();
+
+    let completeVersion!: (value: { version: string; default_labels: Record<string, string> }) => void;
+    mockedVersionApi.getVersion.mockReturnValue(new Promise((resolve) => { completeVersion = resolve; }));
+    renderApp();
+    await user.click(screen.getByRole("button", { name: "Change run labels" }));
+    await act(async () => {
+      completeVersion({ version: "1.0.0", default_labels: { custom: "backend", campaign: "op_backend" } });
+    });
+    expect(screen.getByTestId("home-labels-json")).toHaveTextContent('"campaign":"op_edited"');
+    expect(screen.getByTestId("home-labels-json")).not.toHaveTextContent('"custom"');
+    expect(readUserPreferences("local").labels).toEqual({ campaign: "op_edited", team: "red", custom: null });
+  });
+
+  it("restores saved labels ahead of backend defaults for an authenticated account", async () => {
+    mockGetActiveAccount.mockReturnValue({
+      homeAccountId: "alice-id", tenantId: "tenant", username: "Alice@example.com",
+    });
+    writeUserPreferences("tenant:alice-id", {
+      ...DEFAULT_USER_PREFERENCES,
+      labels: { campaign: "op_saved", team: "red" },
+    });
+    mockedVersionApi.getVersion.mockResolvedValue({
+      version: "1.0.0", default_labels: { operator: "backend_user", campaign: "op_backend", custom: "backend" },
+    });
+    renderApp();
+    await waitFor(() => expect(screen.getByTestId("home-labels-json")).toHaveTextContent('"custom":"backend"'));
+    expect(screen.getByTestId("home-labels-json")).toHaveTextContent('"campaign":"op_saved"');
+    expect(screen.getByTestId("home-labels-json")).toHaveTextContent('"operator":"alice"');
   });
 
   it("starts in home view", () => {
@@ -482,12 +720,10 @@ describe("App", () => {
   it("redirects legacy /targets to the target registry without adding a history entry", async () => {
     const user = userEvent.setup();
     render(
-      <ThemeProvider>
-        <MemoryRouter initialEntries={["/chat", "/targets"]}>
-          <App />
-          <RouterProbe />
-        </MemoryRouter>
-      </ThemeProvider>
+      <MemoryRouter initialEntries={["/chat", "/targets"]}>
+        <App />
+        <RouterProbe />
+      </MemoryRouter>
     );
 
     expect(await screen.findByTestId("target-config")).toBeInTheDocument();
@@ -501,6 +737,85 @@ describe("App", () => {
 
     expect(await screen.findByTestId("chat-window")).toBeInTheDocument();
     expect(screen.getByLabelText("Current URL")).toHaveTextContent(/^\/chat$/);
+  });
+
+  it("renders the preset library as a registry section", () => {
+    renderApp("/registry/scenario-presets");
+
+    expect(screen.getByTestId("main-layout")).toHaveAttribute(
+      "data-current-view",
+      "registry"
+    );
+    expect(screen.getByTestId("scenario-preset-library")).toBeInTheDocument();
+  });
+
+  it("renders the suite library as a registry section", () => {
+    renderApp("/registry/scenario-suites");
+
+    expect(screen.getByTestId("main-layout")).toHaveAttribute(
+      "data-current-view",
+      "registry"
+    );
+    expect(screen.getByTestId("scenario-suite-library")).toBeInTheDocument();
+  });
+
+  it("renders the suite editor as a nested registry route", () => {
+    renderApp("/registry/scenario-suites/nightly_suite/edit");
+
+    const editor = screen.getByTestId("scenario-suite-editor");
+    expect(editor).toHaveAttribute("data-mode", "edit");
+    expect(editor).toHaveTextContent("nightly_suite");
+  });
+
+  it("passes the globally resolved Operation to the preset library", async () => {
+    const operationId = "11111111-1111-4111-8111-111111111111";
+    writeUserPreferences("local", {
+      ...DEFAULT_USER_PREFERENCES,
+      operation: { id: operationId },
+    });
+    mockGetOperation.mockResolvedValue({
+      id: operationId,
+      name: "Preset launch",
+      created_at: "2026-10-20T18:00:00Z",
+    });
+
+    renderApp("/registry/scenario-presets");
+
+    const library = screen.getByTestId("scenario-preset-library");
+    await waitFor(() => {
+      expect(library).toHaveAttribute("data-operation-id", operationId);
+      expect(library).toHaveAttribute("data-defaults-ready", "true");
+    });
+  });
+
+  it("redirects a bookmarked /scanner/presets to the registry section", async () => {
+    render(
+      <MemoryRouter initialEntries={["/scanner/presets"]}>
+        <App />
+        <RouterProbe />
+      </MemoryRouter>
+    );
+
+    expect(await screen.findByTestId("scenario-preset-library")).toBeInTheDocument();
+    expect(screen.getByLabelText("Current URL")).toHaveTextContent(
+      /^\/registry\/scenario-presets$/
+    );
+  });
+
+  it("redirects a bookmarked preset editor URL, keeping the preset it named", async () => {
+    render(
+      <MemoryRouter initialEntries={["/scanner/presets/nightly_probe/edit"]}>
+        <App />
+        <RouterProbe />
+      </MemoryRouter>
+    );
+
+    const editor = await screen.findByTestId("scenario-preset-editor");
+    expect(editor).toHaveAttribute("data-mode", "edit");
+    expect(editor).toHaveTextContent("nightly_probe");
+    expect(screen.getByLabelText("Current URL")).toHaveTextContent(
+      /^\/registry\/scenario-presets\/nightly_probe\/edit$/
+    );
   });
 
   it("renders the converter registry from its direct URL", async () => {
@@ -534,6 +849,41 @@ describe("App", () => {
     expect(screen.getByRole("heading", { level: 1, name: "History" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Attacks" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("attack-history")).toBeInTheDocument();
+  });
+
+  it("renders the dataset catalog when deep-linked to /datasets", () => {
+    renderApp("/datasets");
+
+    expect(screen.getByTestId("main-layout")).toHaveAttribute(
+      "data-current-view",
+      "datasets"
+    );
+    expect(screen.getByTestId("dataset-catalog")).toBeInTheDocument();
+  });
+
+  it("keeps the dataset selection query on the datasets view", () => {
+    renderApp("/datasets/detail?selection_key=dataset%3Aunnamed");
+
+    expect(screen.getByTestId("main-layout")).toHaveAttribute(
+      "data-current-view",
+      "datasets"
+    );
+    expect(screen.getByTestId("dataset-selection")).toHaveAttribute(
+      "data-location",
+      "/datasets/detail?selection_key=dataset%3Aunnamed"
+    );
+  });
+
+  it("switches to the datasets view via the sidebar", () => {
+    renderApp();
+
+    fireEvent.click(screen.getByTestId("nav-datasets"));
+
+    expect(screen.getByTestId("main-layout")).toHaveAttribute(
+      "data-current-view",
+      "datasets"
+    );
+    expect(screen.getByTestId("dataset-catalog")).toBeInTheDocument();
   });
 
   it("renders the scenario catalog when deep-linked to /scanner", () => {
@@ -625,6 +975,21 @@ describe("App", () => {
     expect(screen.getByTestId("scenario-catalog")).toBeInTheDocument();
   });
 
+  it("carries the selected operation ID across history tabs", async () => {
+    const operationId = "6f1b2c3d-0000-4000-8000-000000000001";
+    renderApp(`/history/attacks?operation_id=${operationId}&outcome=success`);
+    fireEvent.click(screen.getByRole("tab", { name: "Scanner" }));
+    const scanner = await screen.findByTestId("scenario-history");
+    const url = new URL(scanner.getAttribute("data-location") ?? "", "http://localhost");
+    expect(url.pathname).toBe("/history/scanner");
+    expect(url.searchParams.getAll("operation_id")).toEqual([operationId]);
+    expect(url.searchParams.has("outcome")).toBe(false);
+    fireEvent.click(screen.getByRole("tab", { name: "Attacks" }));
+    const filters = JSON.parse((await screen.findByTestId("history-filters")).textContent ?? "{}");
+    expect(filters.operationId).toEqual([operationId]);
+    expect(filters.outcome).toBe("success");
+  });
+
   it("switches between history tabs", async () => {
     renderApp("/history/attacks");
 
@@ -634,6 +999,30 @@ describe("App", () => {
       "data-location",
       "/history/scanner"
     );
+  });
+
+  it("clears the remembered operation while preserving each tab's other filters", async () => {
+    function HistoryNavigation() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate("/history/attacks?outcome=success")}>Clear operation via URL</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={["/history/scanner?operation_id=old&operator=alice"]}>
+        <HistoryNavigation />
+        <App />
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("scenario-history");
+    fireEvent.click(screen.getByRole("button", { name: "Clear operation via URL" }));
+    await screen.findByTestId("attack-history");
+    fireEvent.click(screen.getByRole("tab", { name: "Scanner" }));
+    const scanner = await screen.findByTestId("scenario-history");
+    const url = new URL(scanner.getAttribute("data-location") ?? "", "http://localhost");
+    expect(url.searchParams.has("operation_id")).toBe(false);
+    expect(url.searchParams.get("operator")).toBe("alice");
+    fireEvent.click(screen.getByRole("tab", { name: "Attacks" }));
+    expect(await screen.findByTestId("history-filters")).toHaveTextContent("success");
+    expect(screen.getByTestId("history-filters")).not.toHaveTextContent("alice");
   });
 
   it("passes the active target and labels to the scenario detail view", () => {
@@ -877,6 +1266,23 @@ describe("App", () => {
     expect(screen.queryByTestId("chat-window")).not.toBeInTheDocument();
   });
 
+  it.each([404, 503])("distinguishes evidence-origin attack load status %s", async (status: number) => {
+    mockGetAttack.mockRejectedValue({ isAxiosError: true, response: { status, data: {} } });
+    renderApp("/attacks/owner/conversations/source?findingEvidenceId=123e4567-e89b-12d3-a456-426614174000");
+    expect(await screen.findByText(status === 404 ? "Evidence unavailable" : "Could not load attack")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-window")).not.toBeInTheDocument();
+  });
+
+  it("never redirects a missing evidence conversation to the attack main conversation", async () => {
+    mockGetAttack.mockResolvedValue({
+      attack_result_id: "owner", conversation_id: "main", related_conversation_ids: [],
+      labels: {}, objective: "", outcome: "undetermined",
+    });
+    renderApp("/attacks/owner/conversations/source?findingEvidenceId=123e4567-e89b-12d3-a456-426614174000");
+    expect(await screen.findByText("Evidence unavailable")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-window")).not.toBeInTheDocument();
+  });
+
   it("shows the error UX (not not-found) when an attack load fails with a non-404", async () => {
     // A 500 / network / timeout is transient and must not claim the attack was deleted.
     mockGetAttack.mockRejectedValue({ isAxiosError: true, response: { status: 500, data: {} } });
@@ -1002,11 +1408,11 @@ describe("App", () => {
   it("prefers the labels you last picked over the backend defaults", async () => {
     window.localStorage.setItem(
       "pyrit.globalLabels",
-      JSON.stringify({ operator: "roakey", operation: "op_i_picked" }),
+      JSON.stringify({ operator: "roakey", campaign: "op_i_picked" }),
     );
     mockedVersionApi.getVersion.mockResolvedValueOnce({
       version: "2.0.0",
-      default_labels: { operation: "op_from_backend", custom: "value" },
+      default_labels: { campaign: "op_from_backend", custom: "value" },
     });
 
     renderApp();
@@ -1016,13 +1422,13 @@ describe("App", () => {
       expect(labels).toContain('"custom":"value"');
     });
     const labels = screen.getByTestId("global-labels-json").textContent ?? "";
-    expect(labels).toContain('"operation":"op_i_picked"');
+    expect(labels).toContain('"campaign":"op_i_picked"');
   });
 
   it("still takes the operator from the signed-in account over a stored one", async () => {
     window.localStorage.setItem(
       "pyrit.globalLabels",
-      JSON.stringify({ operator: "stored_user", operation: "op_i_picked" }),
+      JSON.stringify({ operator: "stored_user", campaign: "op_i_picked" }),
     );
     mockGetActiveAccount.mockReturnValue({ username: "Real.User@contoso.com" });
     mockedVersionApi.getVersion.mockResolvedValueOnce({
@@ -1038,7 +1444,34 @@ describe("App", () => {
     });
     const labels = screen.getByTestId("global-labels-json").textContent ?? "";
     expect(labels).toContain('"operator":"real.user"');
-    expect(labels).toContain('"operation":"op_i_picked"');
+    expect(labels).toContain('"campaign":"op_i_picked"');
+  });
+
+  it("keeps sends locked until navigation to a created attack commits", async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <Suspense fallback={<div>Loading route</div>}>
+          <App />
+        </Suspense>
+      </MemoryRouter>,
+    );
+
+    let finishRender: () => void = () => {};
+    mockCreatedAttackRender = new Promise<void>((resolve) => { finishRender = resolve; });
+    await user.click(screen.getByRole("button", { name: "Set Conv" }));
+
+    expect(screen.getByTestId("route-location")).toHaveTextContent("/chat");
+    expect(screen.getByRole("button", { name: "Set Conv" })).toBeDisabled();
+
+    await act(async () => {
+      mockCreatedAttackRender = null;
+      finishRender();
+    });
+    expect(screen.getByTestId("route-location").textContent).toBe("/attacks/ar-123/conversations/conv-123");
+    expect(screen.getByTestId("active-conversation-id")).toHaveTextContent("conv-123");
+    expect(screen.getByRole("button", { name: "Set Conv" })).toBeEnabled();
+    expect(mockGetAttack).not.toHaveBeenCalled();
   });
 
   it("stores attack target when conversation is created with active target", () => {
@@ -1726,7 +2159,15 @@ describe("App", () => {
     expect(screen.getByTestId("active-target-name")).toHaveTextContent("none");
   });
 
-  it("preserves an explicitly selected different target and reports a cross-target state", async () => {
+  it("selects the history target instead of the objective default and preserves that default", async () => {
+    const historyTarget = makeTarget({
+      target_registry_name: "history-target",
+      identifier_hash: "other-target-hash",
+    });
+    mockListTargets.mockResolvedValue({
+      items: [historyTarget],
+      pagination: { limit: 200, has_more: false },
+    });
     mockGetAttack.mockResolvedValue({
       attack_result_id: "ar-other-target",
       conversation_id: "conv-other-target",
@@ -1746,10 +2187,13 @@ describe("App", () => {
     await user.click(screen.getByTestId("open-attack"));
 
     await waitFor(() =>
-      expect(screen.getByTestId("target-resolution-status")).toHaveTextContent("explicit-mismatch")
+      expect(screen.getByTestId("target-resolution-status")).toHaveTextContent("resolved")
     );
+    expect(screen.getByTestId("active-target-name")).toHaveTextContent("history-target");
+    await user.click(screen.getByTestId("new-attack"));
     expect(screen.getByTestId("active-target-name")).toHaveTextContent("test_target");
-    expect(mockListTargets).not.toHaveBeenCalled();
+    await user.click(screen.getByTestId("nav-config"));
+    expect(screen.getByTestId("active-target-name")).toHaveTextContent("test_target");
   });
 
   it("hash-validates an explicitly selected matching target against the registry", async () => {
@@ -1787,7 +2231,7 @@ describe("App", () => {
     expect(mockListTargets).toHaveBeenCalledWith(200, undefined);
   });
 
-  it("preserves an explicitly selected alias with the same canonical hash", async () => {
+  it("selects the persisted alias rather than a default with the same hash", async () => {
     const persistedAliasTarget = makeTarget({
       target_registry_name: "persisted-alias",
       target_type: "OpenAIChatTarget",
@@ -1816,7 +2260,7 @@ describe("App", () => {
     await waitFor(() =>
       expect(screen.getByTestId("target-resolution-status")).toHaveTextContent("resolved")
     );
-    expect(screen.getByTestId("active-target-name")).toHaveTextContent("test_target");
+    expect(screen.getByTestId("active-target-name")).toHaveTextContent("persisted-alias");
     expect(mockGetTarget).toHaveBeenCalledWith("persisted-alias");
     expect(mockListTargets).not.toHaveBeenCalled();
   });

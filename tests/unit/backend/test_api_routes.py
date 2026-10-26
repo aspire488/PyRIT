@@ -10,7 +10,9 @@ import os
 import tempfile
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlencode
 
 import pytest
 from fastapi import Request, status
@@ -28,7 +30,14 @@ from pyrit.backend.models.attacks import (
     MessageView,
     TargetResponseStatus,
 )
-from pyrit.backend.models.common import PaginationInfo
+from pyrit.backend.models.common import (
+    MAX_CURSOR_LENGTH,
+    MAX_IDENTIFIER_LENGTH,
+    MAX_ITEMS,
+    MAX_LABEL_KEY_LENGTH,
+    MAX_LABEL_VALUE_LENGTH,
+    PaginationInfo,
+)
 from pyrit.backend.models.converters import (
     ConverterInstance,
     ConverterInstanceListResponse,
@@ -41,8 +50,11 @@ from pyrit.backend.models.targets import (
     TargetTypeResponse,
 )
 from pyrit.backend.routes import version as version_routes
+from pyrit.backend.routes.common import parse_label_query_params
 from pyrit.backend.routes.scores import _get_user_identifier
-from pyrit.backend.services.attack_service import AttackObjectiveConflictError
+from pyrit.backend.services.attack_service import AttackObjectiveConflictError, AttackService
+from pyrit.backend.services.manual_send_scheduler import ManualSendConflictError, ManualSendQueueFullError
+from pyrit.memory import MemoryInterface
 from pyrit.models import AttackOutcome, ConverterIdentifier, MessagePiece, Score, TargetCapabilities, TargetIdentifier
 from pyrit.models.catalog.target import TargetInstance
 
@@ -63,9 +75,9 @@ def _make_message_view(*, role: str = "user", value: str = "hello", sequence: in
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client(compatibility_headers: dict[str, str]) -> TestClient:
     """Create a test client for the FastAPI app."""
-    return TestClient(app)
+    return TestClient(app, headers=compatibility_headers)
 
 
 def test_cors_allows_patch(client: TestClient) -> None:
@@ -135,6 +147,7 @@ class TestAttackRoutes:
                 outcome="success",
                 operator=None,
                 operation=None,
+                operation_ids=None,
                 labels=None,
                 min_turns=None,
                 max_turns=None,
@@ -253,6 +266,41 @@ class TestAttackRoutes:
             )
 
             assert response.status_code == status.HTTP_404_NOT_FOUND
+
+    @pytest.mark.parametrize("reference", [False, True])
+    @pytest.mark.parametrize("field", ["original_value", "converted_value"])
+    def test_create_attack_rejected_media_returns_400(
+        self, *, client: TestClient, managed_media_path: Path, tmp_path: Path, reference: bool, field: str
+    ) -> None:
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"image")
+        value = f"/api/media?{urlencode({'path': str(outside)})}" if reference else str(outside)
+        service = AttackService()
+        with (
+            patch("pyrit.backend.routes.attacks.get_attack_service", return_value=service),
+            patch.object(service._memory, "add_conversation_branches_to_attack_async", new_callable=AsyncMock) as store,
+        ):
+            response = client.post(
+                "/api/attacks",
+                json={
+                    "prepended_conversation": [
+                        {
+                            "role": "user",
+                            "pieces": [
+                                {
+                                    "data_type": "image_path",
+                                    "original_value": value if field == "original_value" else str(managed_media_path),
+                                    "converted_value": value if field == "converted_value" else str(managed_media_path),
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "outside the allowed results directory" in response.json()["detail"]
+        store.assert_not_awaited()
 
     def test_get_attack_success(self, client: TestClient) -> None:
         """Test getting an attack by ID."""
@@ -589,6 +637,31 @@ class TestAttackRoutes:
 
             assert response.status_code == status.HTTP_400_BAD_REQUEST
 
+    @pytest.mark.parametrize(
+        ("error", "status_code"),
+        [
+            (ManualSendConflictError("Conversation is busy"), status.HTTP_409_CONFLICT),
+            (ManualSendQueueFullError("Manual-send queue is full"), status.HTTP_429_TOO_MANY_REQUESTS),
+            (PermissionError("Automated results are read-only. Choose Continue manually."), status.HTTP_403_FORBIDDEN),
+        ],
+    )
+    @pytest.mark.parametrize("send", [False, True])
+    def test_add_message_admission_errors(
+        self, *, client: TestClient, error: Exception, status_code: int, send: bool
+    ) -> None:
+        with patch("pyrit.backend.routes.attacks.get_attack_service") as service:
+            service.return_value.add_message_async = AsyncMock(side_effect=error)
+            response = client.post(
+                "/api/attacks/attack-1/messages",
+                json={
+                    "pieces": [{"original_value": "Hello"}],
+                    "target_conversation_id": "attack-1",
+                    "send": send,
+                },
+            )
+        assert response.status_code == status_code
+        assert response.json()["detail"] == str(error)
+
     def test_add_message_internal_error(self, client: TestClient) -> None:
         """Test adding message when internal error occurs returns 500."""
         with patch("pyrit.backend.routes.attacks.get_attack_service") as mock_get_service:
@@ -763,27 +836,34 @@ class TestAttackRoutes:
             data = response.json()
             assert data["converter_types"] == ["Base64Converter", "ROT13Converter"]
 
-    def test_parse_labels_skips_param_without_colon(self, client: TestClient) -> None:
-        """Test that _parse_labels skips label params that have no colon."""
+    def test_list_attacks_rejects_label_without_colon(self, client: TestClient) -> None:
+        """Test that a label filter without a key:value separator is rejected."""
         with patch("pyrit.backend.routes.attacks.get_attack_service") as mock_get_service:
             mock_service = MagicMock()
-            mock_service.list_attacks_async = AsyncMock(
-                return_value=AttackListResponse(
-                    items=[],
-                    pagination=PaginationInfo(limit=20, has_more=False, next_cursor=None, prev_cursor=None),
-                )
-            )
+            mock_service.list_attacks_async = AsyncMock()
             mock_get_service.return_value = mock_service
 
             response = client.get("/api/attacks?label=nocolon&label=env:prod")
 
-            assert response.status_code == status.HTTP_200_OK
-            call_kwargs = mock_service.list_attacks_async.call_args[1]
-            # Only the valid label should be parsed
-            assert call_kwargs["labels"] == {"env": ["prod"]}
+            assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+            assert "key:value" in response.json()["errors"][0]["message"]
+            mock_service.list_attacks_async.assert_not_called()
 
-    def test_parse_labels_all_invalid_returns_none(self, client: TestClient) -> None:
-        """Test that _parse_labels returns None when all params lack colons."""
+    @pytest.mark.parametrize("route", ["/api/attacks", "/api/labels", "/api/scenarios/runs"])
+    @pytest.mark.parametrize(
+        "label",
+        ["k" * (MAX_LABEL_KEY_LENGTH + 1) + ":v", "k:" + "v" * (MAX_LABEL_VALUE_LENGTH + 1)],
+        ids=["key", "value"],
+    )
+    def test_label_filter_part_over_limit_is_rejected(self, client: TestClient, route: str, label: str) -> None:
+        """Test that label filter keys and values each stay within the label limits."""
+        response = client.get(route, params={"label": label})
+
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+
+    def test_label_filter_at_limits_is_accepted(self, client: TestClient) -> None:
+        """Test that padded label filters at the key and value limits are parsed."""
+        key, value = "k" * MAX_LABEL_KEY_LENGTH, "v" * MAX_LABEL_VALUE_LENGTH
         with patch("pyrit.backend.routes.attacks.get_attack_service") as mock_get_service:
             mock_service = MagicMock()
             mock_service.list_attacks_async = AsyncMock(
@@ -794,11 +874,49 @@ class TestAttackRoutes:
             )
             mock_get_service.return_value = mock_service
 
-            response = client.get("/api/attacks?label=nocolon&label=alsonocolon")
+            response = client.get("/api/attacks", params={"label": f"  {key}  :  {value}  "})
 
             assert response.status_code == status.HTTP_200_OK
-            call_kwargs = mock_service.list_attacks_async.call_args[1]
-            assert call_kwargs["labels"] is None
+            assert mock_service.list_attacks_async.call_args[1]["labels"] == {key: [value]}
+
+    def test_parse_label_query_params_rejects_missing_separator(self) -> None:
+        """Test that the shared label parser never drops a malformed filter."""
+        with pytest.raises(ValueError, match="key:value"):
+            parse_label_query_params(["env:prod", "nocolon"])
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "label=" + "&label=".join(f"k{i}:v" for i in range(MAX_ITEMS + 1)),
+            "cursor=" + "c" * (MAX_CURSOR_LENGTH + 1),
+            "attack_types=" + "a" * (MAX_IDENTIFIER_LENGTH + 1),
+            "min_turns=100000000000000000000",
+        ],
+    )
+    def test_list_attacks_rejects_oversized_query_values(self, client: TestClient, query: str) -> None:
+        """Test that oversized filter values are rejected before the service runs."""
+        with patch("pyrit.backend.routes.attacks.get_attack_service") as mock_get_service:
+            response = client.get(f"/api/attacks?{query}")
+
+            assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+            mock_get_service.assert_not_called()
+
+    def test_get_attack_rejects_oversized_id(self, client: TestClient) -> None:
+        """Test that an oversized path identifier is rejected before the service runs."""
+        with patch("pyrit.backend.routes.attacks.get_attack_service") as mock_get_service:
+            response = client.get(f"/api/attacks/{'a' * (MAX_IDENTIFIER_LENGTH + 1)}")
+
+            assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+            mock_get_service.assert_not_called()
+
+    def test_get_conversation_messages_rejects_oversized_conversation_id(self, client: TestClient) -> None:
+        with patch("pyrit.backend.routes.attacks.get_attack_service") as mock_get_service:
+            response = client.get(
+                "/api/attacks/attack/messages", params={"conversation_id": "c" * (MAX_IDENTIFIER_LENGTH + 1)}
+            )
+
+            assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+            mock_get_service.assert_not_called()
 
     def test_parse_labels_value_with_extra_colons(self, client: TestClient) -> None:
         """Test that _parse_labels handles values containing colons (split on first only)."""
@@ -1152,6 +1270,63 @@ class TestTargetRoutes:
             )
 
             assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+
+    def test_target_routes_pass_server_upload_folder(self, client: TestClient) -> None:
+        with (
+            patch("pyrit.backend.routes.targets.get_target_service") as mock_get_service,
+            patch.object(client.app.state, "target_upload_directory", "/srv/uploads", create=True),
+        ):
+            mock_service = MagicMock()
+            mock_service.list_target_types_async = AsyncMock(return_value=TargetTypeResponse(items=[]))
+            mock_service.create_target_async = AsyncMock(side_effect=ValueError("Set target_upload_directory"))
+            mock_get_service.return_value = mock_service
+
+            types_response = client.get("/api/targets/types")
+            create_response = client.post("/api/targets", json={"type": "HTTPXAPITarget", "params": {}})
+
+        assert types_response.status_code == status.HTTP_200_OK
+        assert create_response.status_code == status.HTTP_400_BAD_REQUEST
+        assert mock_service.list_target_types_async.call_args.kwargs["upload_directory"] == "/srv/uploads"
+        assert mock_service.create_target_async.call_args.kwargs["upload_directory"] == "/srv/uploads"
+
+    def test_create_target_forbids_code_execution_for_non_admin(self, client: TestClient) -> None:
+        """A PermissionError from the service maps to 403, not 400 or 500."""
+        with patch("pyrit.backend.routes.targets.get_target_service") as mock_get_service:
+            mock_service = MagicMock()
+            mock_service.create_target_async = AsyncMock(
+                side_effect=PermissionError("Creating 'HuggingFaceChatTarget' ... requires administrator access.")
+            )
+            mock_get_service.return_value = mock_service
+
+            response = client.post(
+                "/api/targets",
+                json={"type": "HuggingFaceChatTarget", "params": {"trust_remote_code": True}},
+            )
+
+            assert response.status_code == status.HTTP_403_FORBIDDEN
+            assert "administrator access" in response.json()["detail"]
+
+    def test_create_target_passes_admin_flag_from_request(self, client: TestClient) -> None:
+        """The route resolves administrator access and forwards it to the service."""
+        with (
+            patch("pyrit.backend.routes.targets.get_target_service") as mock_get_service,
+            patch("pyrit.backend.routes.targets.has_admin_access", return_value=True) as mock_has_admin,
+        ):
+            mock_service = MagicMock()
+            mock_service.create_target_async = AsyncMock(
+                return_value=TargetInstance(
+                    target_registry_name="target-1",
+                    identifier=TargetIdentifier(class_name="TextTarget"),
+                    capabilities=TargetCapabilities(),
+                )
+            )
+            mock_get_service.return_value = mock_service
+
+            response = client.post("/api/targets", json={"type": "TextTarget", "params": {}})
+
+            assert response.status_code == status.HTTP_201_CREATED
+            mock_has_admin.assert_called_once()
+            assert mock_service.create_target_async.call_args.kwargs["is_admin"] is True
 
     def test_get_target_success(self, client: TestClient) -> None:
         """Test getting a target by ID."""
@@ -1516,6 +1691,12 @@ class TestVersionRoutes:
         assert "version" in data
         assert "display" in data
 
+    def test_get_version_exposes_default_operation_proposal(self, client: TestClient) -> None:
+        with patch.object(app.state, "default_operation", "op_proposed", create=True):
+            response = client.get("/api/version")
+
+        assert response.json()["default_operation"] == "op_proposed"
+
     def test_get_version_with_build_info(self, client: TestClient) -> None:
         """Test getting version with build info from Docker."""
         # Create a temp file to simulate Docker build info
@@ -1620,18 +1801,20 @@ class TestScoreRoutes:
             patch("pyrit.backend.routes.scores.ManualScorer") as mock_manual_scorer_class,
         ):
             memory = mock_memory_class.get_memory_instance.return_value
-            memory.get_message_pieces.return_value = [
-                MagicMock(id=message_id, conversation_id="forked-conversation-id")
-            ]
-            memory.get_attack_results.return_value = [
-                MagicMock(
-                    attack_result_id=str(attack_result_id),
-                    objective="Evaluate the response",
-                    get_active_conversation_ids=MagicMock(
-                        return_value={"primary-conversation-id", "forked-conversation-id"}
-                    ),
-                )
-            ]
+            memory.get_message_pieces_async = AsyncMock(
+                return_value=[MagicMock(id=message_id, conversation_id="forked-conversation-id")]
+            )
+            memory.get_attack_results_async = AsyncMock(
+                return_value=[
+                    MagicMock(
+                        attack_result_id=str(attack_result_id),
+                        objective="Evaluate the response",
+                        get_active_conversation_ids=MagicMock(
+                            return_value={"primary-conversation-id", "forked-conversation-id"}
+                        ),
+                    )
+                ]
+            )
             mock_scorer = mock_manual_scorer_class.return_value
             mock_scorer.score_async = AsyncMock(return_value=[score])
 
@@ -1656,8 +1839,8 @@ class TestScoreRoutes:
         )
         scorable = mock_scorer.score_async.await_args.kwargs["scorable"]
         assert scorable.message_piece_ids == (message_id,)
-        memory.get_attack_results.assert_called_once_with(attack_result_ids=[str(attack_result_id)])
-        memory.update_attack_result_by_id.assert_not_called()
+        memory.get_attack_results_async.assert_called_once_with(attack_result_ids=[str(attack_result_id)])
+        memory.update_attack_result_by_id_async.assert_not_called()
 
     def test_create_manual_true_false_score(self, client: TestClient) -> None:
         """Test creating and persisting a true/false manual score."""
@@ -1675,15 +1858,19 @@ class TestScoreRoutes:
             patch("pyrit.backend.routes.scores.ManualScorer") as mock_manual_scorer_class,
         ):
             memory = mock_memory_class.get_memory_instance.return_value
-            memory.get_message_pieces.return_value = [MagicMock(id=message_id, conversation_id="conversation-id")]
-            memory.get_attack_results.return_value = [
-                MagicMock(
-                    attack_result_id=str(attack_result_id),
-                    objective="Evaluate the response",
-                    get_active_conversation_ids=MagicMock(return_value={"conversation-id"}),
-                )
-            ]
-            memory.update_attack_result_by_id.return_value = True
+            memory.get_message_pieces_async = AsyncMock(
+                return_value=[MagicMock(id=message_id, conversation_id="conversation-id")]
+            )
+            memory.get_attack_results_async = AsyncMock(
+                return_value=[
+                    MagicMock(
+                        attack_result_id=str(attack_result_id),
+                        objective="Evaluate the response",
+                        get_active_conversation_ids=MagicMock(return_value={"conversation-id"}),
+                    )
+                ]
+            )
+            memory.update_attack_result_by_id_async = AsyncMock(return_value=True)
             mock_scorer = mock_manual_scorer_class.return_value
             mock_scorer.score_async = AsyncMock(return_value=[score])
 
@@ -1707,7 +1894,7 @@ class TestScoreRoutes:
             rationale="Objective achieved",
             user_identifier="local-development",
         )
-        update_fields = memory.update_attack_result_by_id.call_args.kwargs["update_fields"]
+        update_fields = memory.update_attack_result_by_id_async.call_args.kwargs["update_fields"]
         assert update_fields["human_score_id"] == score.id
         assert update_fields["outcome"] == AttackOutcome.SUCCESS
 
@@ -1727,14 +1914,18 @@ class TestScoreRoutes:
             patch("pyrit.backend.routes.scores.ManualScorer") as mock_manual_scorer_class,
         ):
             memory = mock_memory_class.get_memory_instance.return_value
-            memory.get_message_pieces.return_value = [MagicMock(id=message_id, conversation_id="conversation-id")]
-            memory.get_attack_results.return_value = [
-                MagicMock(
-                    attack_result_id=str(attack_result_id),
-                    objective="Evaluate the response",
-                    get_active_conversation_ids=MagicMock(return_value={"conversation-id"}),
-                )
-            ]
+            memory.get_message_pieces_async = AsyncMock(
+                return_value=[MagicMock(id=message_id, conversation_id="conversation-id")]
+            )
+            memory.get_attack_results_async = AsyncMock(
+                return_value=[
+                    MagicMock(
+                        attack_result_id=str(attack_result_id),
+                        objective="Evaluate the response",
+                        get_active_conversation_ids=MagicMock(return_value={"conversation-id"}),
+                    )
+                ]
+            )
             mock_manual_scorer_class.return_value.score_async = AsyncMock(return_value=[score])
 
             response = client.post(
@@ -1748,7 +1939,7 @@ class TestScoreRoutes:
             )
 
         assert response.status_code == status.HTTP_201_CREATED
-        memory.update_attack_result_by_id.assert_not_called()
+        memory.update_attack_result_by_id_async.assert_not_called()
 
     def test_create_false_manual_score_sets_attack_failure(self, client: TestClient) -> None:
         """Test that a false manual verdict updates the attack to failure."""
@@ -1766,15 +1957,19 @@ class TestScoreRoutes:
             patch("pyrit.backend.routes.scores.ManualScorer") as mock_manual_scorer_class,
         ):
             memory = mock_memory_class.get_memory_instance.return_value
-            memory.get_message_pieces.return_value = [MagicMock(id=message_id, conversation_id="conversation-id")]
-            memory.get_attack_results.return_value = [
-                MagicMock(
-                    attack_result_id=str(attack_result_id),
-                    objective="Evaluate the response",
-                    get_active_conversation_ids=MagicMock(return_value={"conversation-id"}),
-                )
-            ]
-            memory.update_attack_result_by_id.return_value = True
+            memory.get_message_pieces_async = AsyncMock(
+                return_value=[MagicMock(id=message_id, conversation_id="conversation-id")]
+            )
+            memory.get_attack_results_async = AsyncMock(
+                return_value=[
+                    MagicMock(
+                        attack_result_id=str(attack_result_id),
+                        objective="Evaluate the response",
+                        get_active_conversation_ids=MagicMock(return_value={"conversation-id"}),
+                    )
+                ]
+            )
+            memory.update_attack_result_by_id_async = AsyncMock(return_value=True)
             mock_manual_scorer_class.return_value.score_async = AsyncMock(return_value=[score])
 
             response = client.post(
@@ -1789,7 +1984,7 @@ class TestScoreRoutes:
             )
 
         assert response.status_code == status.HTTP_201_CREATED
-        update_fields = memory.update_attack_result_by_id.call_args.kwargs["update_fields"]
+        update_fields = memory.update_attack_result_by_id_async.call_args.kwargs["update_fields"]
         assert update_fields["outcome"] == AttackOutcome.FAILURE
 
     def test_create_manual_score_message_not_found(self, client: TestClient) -> None:
@@ -1800,7 +1995,7 @@ class TestScoreRoutes:
             patch("pyrit.backend.routes.scores.CentralMemory") as mock_memory_class,
             patch("pyrit.backend.routes.scores.ManualScorer") as mock_manual_scorer_class,
         ):
-            mock_memory_class.get_memory_instance.return_value.get_message_pieces.return_value = []
+            mock_memory_class.get_memory_instance.return_value.get_message_pieces_async = AsyncMock(return_value=[])
 
             response = client.post(
                 "/api/scores/manual",
@@ -1893,9 +2088,15 @@ class TestScoreRoutes:
             patch("pyrit.backend.routes.scores.ManualScorer") as mock_manual_scorer_class,
         ):
             memory = mock_memory_class.get_memory_instance.return_value
-            memory.get_message_pieces.return_value = [MagicMock(id=message_id, conversation_id="conversation-id")]
-            memory.get_attack_results.return_value = [MagicMock(objective="", attack_result_id=str(attack_result_id))]
-            memory.get_attack_results.return_value[0].get_active_conversation_ids.return_value = {"conversation-id"}
+            memory.get_message_pieces_async = AsyncMock(
+                return_value=[MagicMock(id=message_id, conversation_id="conversation-id")]
+            )
+            memory.get_attack_results_async = AsyncMock(
+                return_value=[MagicMock(objective="", attack_result_id=str(attack_result_id))]
+            )
+            memory.get_attack_results_async.return_value[0].get_active_conversation_ids.return_value = {
+                "conversation-id"
+            }
 
             response = client.post(
                 "/api/scores/manual",
@@ -1921,16 +2122,18 @@ class TestScoreRoutes:
             patch("pyrit.backend.routes.scores.ManualScorer") as mock_manual_scorer_class,
         ):
             memory = mock_memory_class.get_memory_instance.return_value
-            memory.get_message_pieces.return_value = [
-                MagicMock(id=message_id, conversation_id="internal-adversarial-conversation-id")
-            ]
-            memory.get_attack_results.return_value = [
-                MagicMock(
-                    objective="Evaluate the response",
-                    attack_result_id=str(attack_result_id),
-                    get_active_conversation_ids=MagicMock(return_value={"conversation-id"}),
-                )
-            ]
+            memory.get_message_pieces_async = AsyncMock(
+                return_value=[MagicMock(id=message_id, conversation_id="internal-adversarial-conversation-id")]
+            )
+            memory.get_attack_results_async = AsyncMock(
+                return_value=[
+                    MagicMock(
+                        objective="Evaluate the response",
+                        attack_result_id=str(attack_result_id),
+                        get_active_conversation_ids=MagicMock(return_value={"conversation-id"}),
+                    )
+                ]
+            )
 
             response = client.post(
                 "/api/scores/manual",
@@ -1975,9 +2178,11 @@ class TestLabelsRoutes:
     def test_get_labels_for_attacks(self, client: TestClient) -> None:
         """Test getting labels from attack results."""
         with patch("pyrit.backend.routes.labels.CentralMemory") as mock_memory_class:
-            mock_memory = MagicMock()
-            mock_memory.get_unique_attack_labels.return_value = {"env": ["prod"], "team": ["red"]}
-            mock_memory.get_unique_attack_attribution.return_value = {"operators": [], "operations": []}
+            mock_memory = MagicMock(spec=MemoryInterface)
+            mock_memory.get_unique_attack_labels_async = AsyncMock(return_value={"env": ["prod"], "team": ["red"]})
+            mock_memory.get_unique_attack_attribution_async = AsyncMock(
+                return_value={"operators": [], "operations": []}
+            )
             mock_memory_class.get_memory_instance.return_value = mock_memory
 
             response = client.get("/api/labels?source=attacks")
@@ -1988,7 +2193,7 @@ class TestLabelsRoutes:
             assert data["labels"] == {"env": ["prod"], "team": ["red"]}
             assert data["operators"] == []
             assert data["operations"] == []
-            mock_memory.get_unique_attack_labels.assert_called_once_with(
+            mock_memory.get_unique_attack_labels_async.assert_called_once_with(
                 operator=None,
                 operation=None,
                 labels=None,
@@ -1996,12 +2201,14 @@ class TestLabelsRoutes:
 
     def test_get_labels_for_attacks_passes_narrowing_filters(self, client: TestClient) -> None:
         with patch("pyrit.backend.routes.labels.CentralMemory") as mock_memory_class:
-            mock_memory = MagicMock()
-            mock_memory.get_unique_attack_labels.return_value = {"env": ["prod"]}
-            mock_memory.get_unique_attack_attribution.return_value = {
-                "operators": ["alice", "bob"],
-                "operations": ["nightly"],
-            }
+            mock_memory = MagicMock(spec=MemoryInterface)
+            mock_memory.get_unique_attack_labels_async = AsyncMock(return_value={"env": ["prod"]})
+            mock_memory.get_unique_attack_attribution_async = AsyncMock(
+                return_value={
+                    "operators": ["alice", "bob"],
+                    "operations": ["nightly"],
+                }
+            )
             mock_memory_class.get_memory_instance.return_value = mock_memory
 
             response = client.get(
@@ -2014,19 +2221,21 @@ class TestLabelsRoutes:
             )
 
             assert response.status_code == status.HTTP_200_OK
-            mock_memory.get_unique_attack_labels.assert_called_once_with(
+            mock_memory.get_unique_attack_labels_async.assert_called_once_with(
                 operator=["alice"],
                 operation=["nightly"],
                 labels={"team": ["red"]},
             )
-            mock_memory.get_unique_attack_attribution.assert_not_called()
+            mock_memory.get_unique_attack_attribution_async.assert_not_called()
 
     def test_get_labels_empty(self, client: TestClient) -> None:
         """Test getting labels when no attack results exist."""
         with patch("pyrit.backend.routes.labels.CentralMemory") as mock_memory_class:
-            mock_memory = MagicMock()
-            mock_memory.get_unique_attack_labels.return_value = {}
-            mock_memory.get_unique_attack_attribution.return_value = {"operators": [], "operations": []}
+            mock_memory = MagicMock(spec=MemoryInterface)
+            mock_memory.get_unique_attack_labels_async = AsyncMock(return_value={})
+            mock_memory.get_unique_attack_attribution_async = AsyncMock(
+                return_value={"operators": [], "operations": []}
+            )
             mock_memory_class.get_memory_instance.return_value = mock_memory
 
             response = client.get("/api/labels?source=attacks")
@@ -2039,12 +2248,16 @@ class TestLabelsRoutes:
     def test_get_labels_multiple_values(self, client: TestClient) -> None:
         """Test getting labels with multiple values per key."""
         with patch("pyrit.backend.routes.labels.CentralMemory") as mock_memory_class:
-            mock_memory = MagicMock()
-            mock_memory.get_unique_attack_labels.return_value = {
-                "env": ["prod", "staging"],
-                "team": ["blue"],
-            }
-            mock_memory.get_unique_attack_attribution.return_value = {"operators": [], "operations": []}
+            mock_memory = MagicMock(spec=MemoryInterface)
+            mock_memory.get_unique_attack_labels_async = AsyncMock(
+                return_value={
+                    "env": ["prod", "staging"],
+                    "team": ["blue"],
+                }
+            )
+            mock_memory.get_unique_attack_attribution_async = AsyncMock(
+                return_value={"operators": [], "operations": []}
+            )
             mock_memory_class.get_memory_instance.return_value = mock_memory
 
             response = client.get("/api/labels")
@@ -2057,12 +2270,14 @@ class TestLabelsRoutes:
     def test_get_labels_returns_keys_without_normalization(self, client: TestClient) -> None:
         """Attack attribution options are separate from arbitrary labels."""
         with patch("pyrit.backend.routes.labels.CentralMemory") as mock_memory_class:
-            mock_memory = MagicMock()
-            mock_memory.get_unique_attack_labels.return_value = {"team": ["red"]}
-            mock_memory.get_unique_attack_attribution.return_value = {
-                "operators": ["alice", "bob"],
-                "operations": ["hunt", "scan"],
-            }
+            mock_memory = MagicMock(spec=MemoryInterface)
+            mock_memory.get_unique_attack_labels_async = AsyncMock(return_value={"team": ["red"]})
+            mock_memory.get_unique_attack_attribution_async = AsyncMock(
+                return_value={
+                    "operators": ["alice", "bob"],
+                    "operations": ["hunt", "scan"],
+                }
+            )
             mock_memory_class.get_memory_instance.return_value = mock_memory
 
             response = client.get("/api/labels")
@@ -2082,12 +2297,12 @@ class TestLabelsRoutes:
     async def test_get_scenario_label_options(self, client: TestClient) -> None:
         """Test that scenario labels use the scenario memory source."""
         with patch("pyrit.backend.routes.labels.CentralMemory") as mock_central_memory:
-            mock_memory = MagicMock()
-            mock_memory.get_unique_scenario_labels.return_value = {"operator": ["alice"]}
+            mock_memory = MagicMock(spec=MemoryInterface)
+            mock_memory.get_unique_scenario_labels_async = AsyncMock(return_value={"operator": ["alice"]})
             mock_central_memory.get_memory_instance.return_value = mock_memory
 
             response = client.get("/api/labels?source=scenarios")
 
         assert response.status_code == status.HTTP_200_OK
         assert response.json() == {"source": "scenarios", "labels": {"operator": ["alice"]}}
-        mock_memory.get_unique_scenario_labels.assert_called_once_with()
+        mock_memory.get_unique_scenario_labels_async.assert_called_once_with()

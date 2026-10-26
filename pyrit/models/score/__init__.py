@@ -16,9 +16,15 @@ from pyrit.common.lazy_imports import get_lazy_dir, resolve_lazy_export
 
 if TYPE_CHECKING:
     from pyrit.models.score.condition import (
+        AnswerMatches,
         Condition,
+        ContentWritten,
         DivergesFromRepetition,
         MatchesObjective,
+        OutputMatches,
+        ProgramBehaves,
+        ProgramCase,
+        ProgramResult,
         ToolCallRequirement,
         ToolsCalled,
     )
@@ -28,17 +34,23 @@ if TYPE_CHECKING:
     )
     from pyrit.models.score.observation import (
         Acquisition,
+        ConversationObservationPayload,
         Observation,
         ObservationPayload,
+        ProgramExecutionObservationPayload,
         ScorerTargetResponsePayload,
+        SurfaceObservationPayload,
         ToolEventsObservationPayload,
     )
     from pyrit.models.score.scorable import (
         ContentEntryScorable,
         ContentScorable,
+        ConversationScorable,
         MessageScorable,
+        ProgramExecutionScorable,
         Scorable,
         ScorableUnion,
+        SurfaceScorable,
         TraceScorable,
         scorable_from_dict,
     )
@@ -50,6 +62,8 @@ if TYPE_CHECKING:
         UndeterminedScoreError,
         UnvalidatedScore,
     )
+    from pyrit.models.score.surface import SurfaceBaseline, SurfaceCoverage, SurfaceEntry, SurfaceMatch
+    from pyrit.models.score.text_matcher import Contains, Equals, Regex, TextMatcher
     from pyrit.models.score.trace import (
         ToolExecution,
         TraceCoverage,
@@ -60,11 +74,25 @@ if TYPE_CHECKING:
     )
 
 _LAZY_EXPORTS: dict[str, str] = {
+    "ProgramBehaves": "pyrit.models.score.condition",
+    "ProgramCase": "pyrit.models.score.condition",
+    "ProgramExecutionObservationPayload": "pyrit.models.score.observation",
+    "ProgramExecutionScorable": "pyrit.models.score.scorable",
+    "ProgramResult": "pyrit.models.score.condition",
+    "ConversationScorable": "pyrit.models.score.scorable",
+    "ConversationObservationPayload": "pyrit.models.score.observation",
+    "Contains": "pyrit.models.score.text_matcher",
+    "Equals": "pyrit.models.score.text_matcher",
+    "Regex": "pyrit.models.score.text_matcher",
+    "TextMatcher": "pyrit.models.score.text_matcher",
+    "OutputMatches": "pyrit.models.score.condition",
     "Acquisition": "pyrit.models.score.observation",
+    "AnswerMatches": "pyrit.models.score.condition",
     "ComponentIdentifierField": "pyrit.models.score.score",
     "Condition": "pyrit.models.score.condition",
     "ContentEntryScorable": "pyrit.models.score.scorable",
     "ContentScorable": "pyrit.models.score.scorable",
+    "ContentWritten": "pyrit.models.score.condition",
     "DivergesFromRepetition": "pyrit.models.score.condition",
     "ScorerTargetResponsePayload": "pyrit.models.score.observation",
     "MatchesObjective": "pyrit.models.score.condition",
@@ -77,6 +105,12 @@ _LAZY_EXPORTS: dict[str, str] = {
     "ScoreStatus": "pyrit.models.score.score",
     "ScoreType": "pyrit.models.score.score",
     "ScoringExpectation": "pyrit.models.score.expectation",
+    "SurfaceBaseline": "pyrit.models.score.surface",
+    "SurfaceCoverage": "pyrit.models.score.surface",
+    "SurfaceEntry": "pyrit.models.score.surface",
+    "SurfaceMatch": "pyrit.models.score.surface",
+    "SurfaceObservationPayload": "pyrit.models.score.observation",
+    "SurfaceScorable": "pyrit.models.score.scorable",
     "ToolCallRequirement": "pyrit.models.score.condition",
     "ToolEventsObservationPayload": "pyrit.models.score.observation",
     "ToolExecution": "pyrit.models.score.trace",

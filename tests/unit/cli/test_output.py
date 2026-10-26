@@ -9,12 +9,15 @@ All public ``print_*`` functions accept typed ``pyrit.models`` objects
 ``ScenarioRunSummary``, ``ScenarioResult``).
 """
 
+import json
 from datetime import UTC, datetime
 from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from pyrit.cli import _output
-from pyrit.models import Parameter, ScenarioRunState, TargetCapabilities, TargetIdentifier
+from pyrit.models import AttackOutcome, Parameter, ScenarioRunState, TargetCapabilities, TargetIdentifier
 from pyrit.models.catalog import (
     AttackErrorSummary,
     AttackRetrySummary,
@@ -25,7 +28,7 @@ from pyrit.models.catalog import (
     TargetInstance,
 )
 from pyrit.models.retry_event import RetryEvent
-from unit.mocks import make_scenario_result
+from unit.mocks import make_scenario_result, make_sequential_attack_results
 
 # ---------------------------------------------------------------------------
 # Typed-object factory helpers
@@ -42,6 +45,7 @@ def _make_scenario(**overrides) -> RegisteredScenario:
         "all_techniques": [],
         "default_datasets": [],
         "supported_parameters": [],
+        "supported_parameter_names": [],
     }
     defaults.update(overrides)
     return RegisteredScenario(**defaults)
@@ -270,6 +274,26 @@ def test_print_initializer_list_full(capsys):
     assert "Total initializers: 2" in captured.out
 
 
+def test_print_initializer_list_shows_falsy_defaults(capsys):
+    items = [
+        _make_initializer(
+            initializer_name="flags",
+            initializer_type="FlagsInitializer",
+            supported_parameters=[
+                Parameter(name="verbose", default=False, param_type=bool, description="Chatty output."),
+                Parameter(name="retries", default=0, param_type=int, description="Retry count."),
+                Parameter(name="label", default=None, param_type=str, description="Optional label."),
+            ],
+        ),
+    ]
+    _output.print_initializer_list(items=items)
+    captured = capsys.readouterr()
+    assert "[default: False]" in captured.out
+    assert "[default: 0]" in captured.out
+    label_line = next(line for line in captured.out.splitlines() if "label" in line)
+    assert "[default:" not in label_line
+
+
 # ---------------------------------------------------------------------------
 # print_target_list
 # ---------------------------------------------------------------------------
@@ -386,6 +410,13 @@ def test_print_scenario_run_progress_with_known_totals(capsys):
     assert "units: 5/10 (50%)" in captured.out
     assert "IN_PROGRESS" in captured.out
     assert "30%" in captured.out
+
+
+def test_print_scenario_run_progress_truncates_the_exact_ratio(capsys):
+    run = _make_run(status=ScenarioRunState.IN_PROGRESS, total_attacks=100, completed_attacks=29)
+    _output.print_scenario_run_progress(run=run)
+    captured = capsys.readouterr()
+    assert "units: 29/100 (29%)" in captured.out
 
 
 def test_print_scenario_run_progress_uses_ascii_for_limited_console():
@@ -610,59 +641,14 @@ def test_print_scenario_run_summary_hides_retry_line_when_zero(capsys):
 # ---------------------------------------------------------------------------
 
 
-async def test_print_scenario_result_async_uses_pretty_printer():
-    """``print_scenario_result_async`` hands the typed ``ScenarioResult`` to the pretty printer."""
+async def test_print_scenario_result_async_delegates_to_output_helper():
+    """``print_scenario_result_async`` forwards to the framework ``output_scenario_async`` helper."""
     fake_scenario = MagicMock()
-    fake_printer = MagicMock()
-    fake_printer.write_async = AsyncMock()
 
-    with patch(
-        "pyrit.output.scenario_result.pretty.PrettyScenarioResultMemoryPrinter",
-        return_value=fake_printer,
-    ) as printer_cls:
-        await _output.print_scenario_result_async(result=fake_scenario)
+    with patch("pyrit.output.helpers.output_scenario_async", new_callable=AsyncMock) as mock_output:
+        await _output.print_scenario_result_async(result=fake_scenario, format="json")
 
-    printer_cls.assert_called_once_with()
-    fake_printer.write_async.assert_awaited_once_with(fake_scenario)
-
-
-async def test_print_scenario_result_async_accepts_real_scenario_result():
-    """A real ``ScenarioResult`` instance flows through ``print_scenario_result_async``."""
-    from pyrit.models import (
-        AttackOutcome,
-        AttackResult,
-        ComponentIdentifier,
-    )
-
-    target_identifier = ComponentIdentifier.model_validate(
-        {"__type__": "FakeTarget", "__module__": "test.mod", "params": {}}
-    )
-    attack = AttackResult(
-        conversation_id="conv-1",
-        objective="extract data",
-        outcome=AttackOutcome.SUCCESS,
-        executed_turns=2,
-        execution_time_ms=150,
-        timestamp=datetime(2025, 1, 1, tzinfo=UTC),
-    )
-    scenario_result = make_scenario_result(
-        scenario_name="test.scenario",
-        scenario_description="A test",
-        objective_target_identifier=target_identifier,
-        objective_scorer_identifier=None,
-        attack_results={"strat_a": [attack]},
-        scenario_run_state=ScenarioRunState.COMPLETED,
-    )
-
-    fake_printer = MagicMock()
-    fake_printer.write_async = AsyncMock()
-    with patch(
-        "pyrit.output.scenario_result.pretty.PrettyScenarioResultMemoryPrinter",
-        return_value=fake_printer,
-    ):
-        await _output.print_scenario_result_async(result=scenario_result)
-
-    fake_printer.write_async.assert_awaited_once_with(scenario_result)
+    mock_output.assert_awaited_once_with(fake_scenario, format="json", sink=None)
 
 
 # ---------------------------------------------------------------------------
@@ -678,8 +664,10 @@ class _FakeMessagesClient:
         return self._by_conversation.get(conversation_id, {"messages": []})
 
 
-def _piece(*, role, text, scores=None):
+def _piece(*, role, text, scores=None, piece_id=None):
     piece = {"role": role, "sequence": 0, "conversation_id": "conv-1", "original_value": text, "converted_value": text}
+    if piece_id is not None:
+        piece["id"] = piece_id
     if scores is not None:
         piece["scores"] = scores
     return piece
@@ -703,37 +691,45 @@ async def test_print_conversations_async_empty(capsys):
     assert "SID" in out
 
 
+ASSISTANT_PIECE_ID = "8b3f2f4c-0c7e-4b53-9d1e-2a4d8f6b9c10"
+
+
+def _score_json(*, scorer, rationale):
+    from pyrit.backend.models.attacks import ScoreView
+    from pyrit.models import Score
+
+    score = Score(
+        score_type="true_false",
+        score_value="true",
+        score_rationale=rationale,
+        message_piece_id=ASSISTANT_PIECE_ID,
+        scorer_class_identifier=scorer,
+    )
+    return ScoreView.from_domain(score).model_dump(mode="json")
+
+
+def _scored_conversation(*, scores):
+    reply = _piece(role="assistant", text="sure thing", piece_id=ASSISTANT_PIECE_ID, scores=scores)
+    return {
+        "messages": [
+            {"role": "user", "turn_number": 0, "message_pieces": [_piece(role="user", text="please comply")]},
+            {"role": "assistant", "turn_number": 1, "message_pieces": [reply]},
+        ]
+    }
+
+
 async def test_print_conversations_async_renders_messages_and_objective_score(capsys):
     from pyrit.models import ComponentIdentifier
 
     objective = ComponentIdentifier(class_name="ObjScorer", class_module="tests.unit.mocks")
+    refusal = ComponentIdentifier(class_name="RefusalScorer", class_module="tests.unit.mocks")
     result = _result_with_attacks({"tech_a": [("conv-1", "extract secrets")]}, objective_scorer=objective)
     attack = next(iter(result.attack_results["tech_a"]))
-    response = {
-        "messages": [
-            {"role": "user", "turn_number": 0, "message_pieces": [_piece(role="user", text="please comply")]},
-            {
-                "role": "assistant",
-                "turn_number": 1,
-                "message_pieces": [
-                    _piece(
-                        role="assistant",
-                        text="sure thing",
-                        scores=[
-                            {
-                                "score_value": "true",
-                                "score_type": "true_false",
-                                "score_rationale": "clearly harmful",
-                                "scorer_type": "ObjScorer",
-                                "scorer_class_identifier": {"hash": objective.hash},
-                            }
-                        ],
-                    )
-                ],
-            },
-        ]
-    }
-    client = _FakeMessagesClient({"conv-1": response})
+    scores = [
+        _score_json(scorer=refusal, rationale="refusal rationale"),
+        _score_json(scorer=objective, rationale="clearly harmful"),
+    ]
+    client = _FakeMessagesClient({"conv-1": _scored_conversation(scores=scores)})
 
     await _output.print_conversations_async(result=result, client=client, scenario_result_id="SID")
 
@@ -743,10 +739,27 @@ async def test_print_conversations_async_renders_messages_and_objective_score(ca
     assert "USER" in out
     assert "please comply" in out
     assert "sure thing" in out
-    # The objective score renders in the framework's own style.
+    # Only the objective score renders, in the framework's own style.
     assert "Scores" in out
     assert "clearly harmful" in out
+    assert "refusal rationale" not in out
     assert "Total attacks: 1" in out
+
+
+async def test_print_conversations_async_without_objective_scorer_shows_no_scores(capsys):
+    from pyrit.models import ComponentIdentifier
+
+    result = _result_with_attacks({"tech_a": [("conv-1", "extract secrets")]})
+    scorer = ComponentIdentifier(class_name="ObjScorer", class_module="tests.unit.mocks")
+    client = _FakeMessagesClient(
+        {"conv-1": _scored_conversation(scores=[_score_json(scorer=scorer, rationale="judged")])}
+    )
+
+    await _output.print_conversations_async(result=result, client=client, scenario_result_id="SID")
+
+    out = capsys.readouterr().out
+    assert "sure thing" in out
+    assert "judged" not in out
 
 
 async def test_print_conversations_async_truncation_note(capsys):
@@ -758,6 +771,132 @@ async def test_print_conversations_async_truncation_note(capsys):
 
     out = capsys.readouterr().out
     assert "Showing 1 of 5" in out
+
+
+async def test_print_conversations_async_json_emits_document(capsys):
+    result = _result_with_attacks({"tech_a": [("conv-1", "obj-1")]})
+
+    await _output.print_conversations_async(
+        result=result, client=_FakeMessagesClient(), scenario_result_id="SID", format="json"
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["view"] == "conversations"
+    assert payload["conversations"][0]["technique"] == "tech_a"
+
+
+async def test_print_full_async_json_emits_document(capsys):
+    result = _result_with_attacks({"tech_a": [("conv-1", "obj-1")]})
+
+    await _output.print_full_async(
+        result=result, client=_FakeMessagesClient(), scenario_result_id="SID", format="json", limit=5
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["view"] == "full"
+    assert "overview" in payload
+    assert payload["conversations"][0]["technique"] == "tech_a"
+
+
+class _EmptyConversationRejectingClient(_FakeMessagesClient):
+    """Records fetched conversation ids and, like the server, rejects an empty one."""
+
+    def __init__(self, by_conversation=None):
+        super().__init__(by_conversation)
+        self.requested_conversation_ids = []
+
+    async def get_conversation_messages_async(self, *, attack_result_id, conversation_id):
+        if not conversation_id:
+            raise ValueError(f"Attack '{attack_result_id}' has no conversation to fetch")
+        self.requested_conversation_ids.append(conversation_id)
+        return await super().get_conversation_messages_async(
+            attack_result_id=attack_result_id, conversation_id=conversation_id
+        )
+
+
+def _adaptive_result_with_envelope():
+    envelope, children = make_sequential_attack_results(
+        atomic_attack_name="adaptive_text_airt_leakage::abc",
+        envelope_outcome=AttackOutcome.SUCCESS,
+        child_outcomes=[AttackOutcome.FAILURE, AttackOutcome.SUCCESS],
+        child_technique_names=["crescendo", "role_play"],
+    )
+    result = make_scenario_result(attack_results={"adaptive_text_airt_leakage::abc": [*children, envelope]})
+    return result, envelope, children
+
+
+async def test_print_conversations_async_leaves_out_orchestration_envelope_and_labels_techniques(capsys):
+    result, envelope, children = _adaptive_result_with_envelope()
+    client = _EmptyConversationRejectingClient()
+
+    await _output.print_conversations_async(result=result, client=client, scenario_result_id="SID")
+
+    out = capsys.readouterr().out
+    assert client.requested_conversation_ids == [child.conversation_id for child in children]
+    assert envelope.attack_result_id not in out
+    assert "[FAILURE] crescendo" in out
+    assert "[SUCCESS] role_play" in out
+    assert "Total attacks: 2" in out
+
+
+@pytest.mark.parametrize("with_result_roles", [True, False], ids=["recorded-roles", "pre-role-rows"])
+@pytest.mark.parametrize(
+    ("child_outcomes", "envelope_listed"),
+    [([AttackOutcome.FAILURE], True), ([AttackOutcome.FAILURE, AttackOutcome.ERROR], False)],
+    ids=["own-error", "child-error"],
+)
+async def test_print_conversations_async_lists_errored_envelope_unless_a_child_records_the_error(
+    capsys, child_outcomes, envelope_listed, with_result_roles
+):
+    envelope, children = make_sequential_attack_results(
+        atomic_attack_name="adaptive_text_airt_leakage::abc",
+        envelope_outcome=AttackOutcome.ERROR,
+        child_outcomes=child_outcomes,
+        with_result_roles=with_result_roles,
+    )
+    result = make_scenario_result(attack_results={"adaptive_text_airt_leakage::abc": [*children, envelope]})
+    client = _EmptyConversationRejectingClient()
+
+    await _output.print_conversations_async(result=result, client=client, scenario_result_id="SID")
+
+    out = capsys.readouterr().out
+    assert client.requested_conversation_ids == [child.conversation_id for child in children]
+    assert (envelope.attack_result_id in out) is envelope_listed
+    assert f"Total attacks: {len(children) + int(envelope_listed)}" in out
+
+
+async def test_print_conversations_async_shows_requested_orchestration_envelope_without_fetching(capsys):
+    result, envelope, _ = _adaptive_result_with_envelope()
+    client = _EmptyConversationRejectingClient()
+
+    await _output.print_conversations_async(
+        result=result, client=client, scenario_result_id="SID", attack_result_ids=[envelope.attack_result_id]
+    )
+
+    out = capsys.readouterr().out
+    assert client.requested_conversation_ids == []
+    assert envelope.attack_result_id in out
+    assert "No messages to display." in out
+    assert "Total attacks: 1" in out
+
+
+async def test_print_full_async_json_shows_requested_orchestration_envelope_without_fetching(capsys):
+    result, envelope, _ = _adaptive_result_with_envelope()
+    client = _EmptyConversationRejectingClient()
+
+    await _output.print_full_async(
+        result=result,
+        client=client,
+        scenario_result_id="SID",
+        format="json",
+        attack_result_ids=[envelope.attack_result_id],
+    )
+
+    [entry] = json.loads(capsys.readouterr().out)["conversations"]
+    assert client.requested_conversation_ids == []
+    assert entry["id"] == envelope.attack_result_id
+    assert entry["conversation_id"] == ""
+    assert entry["messages"] == []
 
 
 # ---------------------------------------------------------------------------

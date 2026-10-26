@@ -11,6 +11,7 @@ import re
 import threading
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,14 +28,12 @@ generator_mod = pytest.importorskip(
     "pyrit.executor.promptgen.gcg.generator",
     reason="GCG optional dependencies (torch, transformers, etc.) not installed",
 )
-GCGGenerator = generator_mod.GCGGenerator
-GCGContext = generator_mod.GCGContext
-GCGResult = generator_mod.GCGResult
-
 from unit.executor.promptgen.gcg.trajectory_stubs import (  # noqa: E402
     TrajectoryPromptManager,
     TrajectoryWorker,
 )
+
+from pyrit.executor.promptgen.gcg.generator import GCGContext, GCGGenerator, GCGResult  # noqa: E402
 
 _LLAMA_2 = "meta-llama/Llama-2-7b-chat-hf"
 
@@ -187,7 +186,7 @@ class TestToAttackParamsToken:
 @pytest.fixture
 def patched_get_workers():
     """Patch the heavy worker spawn so lifecycle tests don't try to load real models."""
-    with patch.object(generator_mod, "get_workers") as mock:
+    with patch.object(generator_mod, "get_workers") as mock, patch.object(generator_mod, "start_workers"):
         yield mock
 
 
@@ -267,7 +266,7 @@ class TestApplyTargetAugmentation:
 
 
 class TestExtensionWiring:
-    def test_create_attack_uses_suffix_initializer_when_configured(self) -> None:
+    def test_create_attack_reuses_resolved_initial_suffix(self) -> None:
         class _SuffixInitStub:
             def __init__(self) -> None:
                 self.calls: list[object] = []
@@ -286,7 +285,7 @@ class TestExtensionWiring:
 
         with patch.object(generator_mod, "IndividualPromptAttack") as mock_individual:
             gen._create_attack(
-                params=MagicMock(),
+                params=SimpleNamespace(control_init=gen._resolve_control_init(workers=[worker])),
                 managers={"MPA": MagicMock()},
                 train_goals=["g"],
                 train_targets=["t"],
@@ -369,6 +368,7 @@ class TestExtensionWiring:
                 sampling=sampling,
                 loss=loss,
                 candidate_filter=candidate_filter,
+                use_prefix_cache=True,
             ),
             output=GCGOutputConfig(result_prefix=str(tmp_path / "gcg")),
         )
@@ -395,6 +395,7 @@ class TestExtensionWiring:
         assert mpa_factory.keywords["sampling"] is sampling
         assert mpa_factory.keywords["loss"] is loss
         assert mpa_factory.keywords["candidate_filter"] is candidate_filter
+        assert mpa_factory.keywords["use_prefix_cache"] is True
 
 
 class TestReadResult:
@@ -492,6 +493,7 @@ class TestConcurrentGenerators:
 
         with (
             patch.object(generator_mod, "get_workers") as get_workers,
+            patch.object(generator_mod, "start_workers"),
             patch.object(generator_mod.attack_lib, "GCGPromptManager", TrajectoryPromptManager),
         ):
             get_workers.return_value = ([TrajectoryWorker(0)], [])
@@ -517,6 +519,7 @@ class TestConcurrentGenerators:
         targets = ["10 11", "12 13"]
         with (
             patch.object(generator_mod, "get_workers", return_value=([TrajectoryWorker(0)], [])),
+            patch.object(generator_mod, "start_workers"),
             patch.object(generator_mod.attack_lib, "GCGPromptManager", TrajectoryPromptManager),
             patch.object(
                 GCGGenerator, "_apply_target_augmentation", wraps=GCGGenerator._apply_target_augmentation

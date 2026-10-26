@@ -36,6 +36,9 @@ export const useObjectiveHeaderStyles = makeStyles({
       padding: `${tokens.spacingVerticalS} ${tokens.spacingHorizontalM}`,
     },
   },
+  emptyHeaderSection: {
+    alignItems: 'center',
+  },
   label: {
     flexShrink: 0,
   },
@@ -62,7 +65,7 @@ export const useObjectiveHeaderStyles = makeStyles({
     display: 'flex',
     flexDirection: 'column',
     gap: tokens.spacingVerticalM,
-    width: 'min(420px, calc(100vw - 32px))',
+    width: 'min(600px, calc(100vw - 32px))',
     maxHeight: 'calc(100vh - 32px)',
     overflowY: 'auto',
   },
@@ -72,6 +75,31 @@ export const useObjectiveHeaderStyles = makeStyles({
     justifyContent: 'space-between',
     gap: tokens.spacingHorizontalM,
     minWidth: 0,
+  },
+  scorerValue: {
+    minWidth: 0,
+    maxWidth: '70%',
+    whiteSpace: 'normal',
+    overflowWrap: 'anywhere',
+    textAlign: 'left',
+    ...mobileTouchTargetHeight,
+  },
+  scorerLabel: {
+    display: 'flex',
+    flexDirection: 'column',
+    minWidth: 0,
+  },
+  secondaryText: {
+    color: tokens.colorNeutralForeground3,
+  },
+  scorerSelection: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: tokens.spacingVerticalS,
+  },
+  resultDivider: {
+    flexGrow: 0,
+    flexShrink: 0,
   },
   scorerIdentity: {
     display: 'flex',
@@ -83,9 +111,21 @@ export const useObjectiveHeaderStyles = makeStyles({
   },
   identityValue: {
     overflowWrap: 'anywhere',
+    whiteSpace: 'pre-wrap',
+  },
+  errorDetails: {
+    margin: 0,
+    minWidth: 0,
+    maxHeight: '30vh',
+    overflow: 'auto',
+    whiteSpace: 'pre-wrap',
+    overflowWrap: 'anywhere',
+    fontFamily: tokens.fontFamilyMonospace,
+    fontSize: tokens.fontSizeBase200,
   },
   resultActions: {
     display: 'flex',
+    flexWrap: 'wrap',
     justifyContent: 'flex-end',
     gap: tokens.spacingHorizontalS,
   },
@@ -108,6 +148,17 @@ export const useObjectiveHeaderStyles = makeStyles({
     minWidth: 0,
     color: tokens.colorNeutralForeground1,
     fontSize: tokens.fontSizeBase300,
+  },
+  editableContent: {
+    border: 0,
+    backgroundColor: 'transparent',
+    padding: 0,
+    textAlign: 'left',
+    fontFamily: 'inherit',
+    cursor: 'pointer',
+    ...mobileTouchTargetHeight,
+    ':hover': { color: tokens.colorBrandForegroundLink },
+    ':focus-visible': { outline: `2px solid ${tokens.colorStrokeFocus2}` },
   },
   contentCollapsed: {
     whiteSpace: 'nowrap',

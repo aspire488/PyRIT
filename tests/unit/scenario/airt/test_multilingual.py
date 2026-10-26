@@ -3,6 +3,9 @@
 
 """Tests for the Multilingual scenario."""
 
+from collections.abc import Generator
+from contextlib import contextmanager
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -23,6 +26,7 @@ from pyrit.prompt_normalizer import ConverterConfiguration
 from pyrit.prompt_target import PromptTarget
 from pyrit.registry.components.attack_technique_registry import AttackTechniqueRegistry
 from pyrit.scenario.core.attack_technique_factory import AttackTechniqueFactory
+from pyrit.scenario.core.dataset_configuration import DatasetAttackConfiguration
 from pyrit.scenario.scenarios.airt.multilingual import (
     _DEFAULT_NUM_LANGUAGES,
     _LANGUAGES_METADATA_KEY,
@@ -79,7 +83,7 @@ def mock_memory_seed_groups() -> list[AttackSeedGroup]:
 
 
 @pytest.fixture
-def mock_objective_target() -> PromptTarget:
+def mock_objective_target() -> MagicMock:
     """Create the target under test."""
     mock = MagicMock(spec=PromptTarget)
     mock.get_identifier.return_value = _mock_identifier("MockObjectiveTarget")
@@ -88,7 +92,7 @@ def mock_objective_target() -> PromptTarget:
 
 
 @pytest.fixture
-def mock_adversarial_chat() -> PromptTarget:
+def mock_adversarial_chat() -> MagicMock:
     """Create the target used by translation converters."""
     mock = MagicMock(spec=PromptTarget)
     mock.get_identifier.return_value = _mock_identifier("MockAdversarialChat")
@@ -97,20 +101,25 @@ def mock_adversarial_chat() -> PromptTarget:
 
 
 @pytest.fixture
-def mock_objective_scorer() -> TrueFalseScorer:
+def mock_objective_scorer() -> MagicMock:
     """Create the objective scorer."""
     mock = MagicMock(spec=TrueFalseScorer)
     mock.get_identifier.return_value = _mock_identifier("MockObjectiveScorer")
     return mock
 
 
-def _patch_seed_groups(mock_memory_seed_groups):
-    return patch.object(
-        Multilingual,
-        "_resolve_seed_groups_by_dataset_async",
-        new_callable=AsyncMock,
-        return_value={"harmbench": mock_memory_seed_groups},
-    )
+@contextmanager
+def _patch_seed_groups(mock_memory_seed_groups: list[AttackSeedGroup]) -> Generator[None, None, None]:
+    with (
+        patch.object(DatasetAttackConfiguration, "prepare_async", new_callable=AsyncMock),
+        patch.object(
+            Multilingual,
+            "_resolve_seed_groups_by_dataset_async",
+            new_callable=AsyncMock,
+            return_value={"harmbench": mock_memory_seed_groups},
+        ),
+    ):
+        yield
 
 
 def _request_converters(atomic_attack):
@@ -136,6 +145,65 @@ def _response(text: str) -> list[Message]:
 @pytest.mark.usefixtures("patch_central_database")
 class TestMultilingual:
     """Validate multilingual technique selection and converter construction."""
+
+    @pytest.mark.parametrize("converter_type", [Base64Converter, QRCodeConverter])
+    async def test_local_factory_wins_before_filtering_and_during_execution_async(
+        self,
+        *,
+        converter_type: type[Base64Converter] | type[QRCodeConverter],
+        mock_objective_target: PromptTarget,
+        mock_adversarial_chat: PromptTarget,
+        mock_objective_scorer: TrueFalseScorer,
+        mock_memory_seed_groups: list[AttackSeedGroup],
+    ) -> None:
+        before = _build_multilingual_technique()
+        registry = AttackTechniqueRegistry.get_registry_singleton()
+        registered = AttackTechniqueFactory(
+            name=_PROMPT_SENDING,
+            attack_class=PromptSendingAttack,
+            description="Runtime override",
+            technique_tags=["runtime_only"],
+            attack_kwargs={
+                "attack_converter_config": AttackConverterConfig(
+                    request_converters=ConverterConfiguration.from_converters(converters=[converter_type()])
+                )
+            },
+        )
+        registry.instances.register_runtime(registered)
+        current = _build_multilingual_technique()
+        assert current is not before
+        assert current(_PROMPT_SENDING).description == before(_PROMPT_SENDING).description
+        assert current(_PROMPT_SENDING).tags == before(_PROMPT_SENDING).tags
+        assert "runtime_only" not in current.get_aggregate_tags()
+
+        with _patch_seed_groups(mock_memory_seed_groups):
+            scenario = Multilingual(adversarial_chat=mock_adversarial_chat, objective_scorer=mock_objective_scorer)
+            scenario.set_params_from_args(
+                args={
+                    "objective_target": mock_objective_target,
+                    "scenario_techniques": [current(_PROMPT_SENDING)],
+                    "languages": ["French"],
+                    "translation_strategies": [_TRANSLATION],
+                    "include_baseline": False,
+                }
+            )
+            await scenario.initialize_async()
+
+        assert len(scenario._atomic_attacks) == 1
+        assert [type(converter) for converter in _request_converters(scenario._atomic_attacks[0])] == [
+            TranslationConverter
+        ]
+        assert registry.instances.get(_PROMPT_SENDING) is registered
+
+    @pytest.mark.parametrize("explicit_target", [False, True])
+    def test_default_adversarial_usage(
+        self, *, explicit_target: bool, mock_adversarial_chat: PromptTarget, mock_objective_scorer: TrueFalseScorer
+    ) -> None:
+        scenario = Multilingual(
+            adversarial_chat=mock_adversarial_chat if explicit_target else None,
+            objective_scorer=mock_objective_scorer,
+        )
+        assert scenario.uses_default_adversarial_target is not explicit_target
 
     def test_technique_catalog_includes_only_translation_compatible_factories(self) -> None:
         technique_class = _build_multilingual_technique()
@@ -309,7 +377,9 @@ class TestMultilingual:
         metadata = scenario._build_initial_scenario_metadata()
         assert metadata[_LANGUAGES_METADATA_KEY] == ["French", "Spanish"]
 
-    def test_resolve_languages_replays_persisted_set_on_resume(self, mock_adversarial_chat, mock_objective_scorer):
+    async def test_resolve_languages_replays_persisted_set_on_resume(
+        self, mock_adversarial_chat, mock_objective_scorer
+    ):
         scenario = Multilingual(
             adversarial_chat=mock_adversarial_chat,
             objective_scorer=mock_objective_scorer,
@@ -318,8 +388,8 @@ class TestMultilingual:
         stored = MagicMock()
         stored.metadata = {_LANGUAGES_METADATA_KEY: ["French", "Spanish"]}
 
-        with patch.object(scenario._memory, "get_scenario_results", return_value=[stored]):
-            assert scenario._resolve_languages() == ["French", "Spanish"]
+        with patch.object(scenario._memory, "get_scenario_results_async", return_value=[stored]):
+            assert (await scenario._resolve_languages_async()) == ["French", "Spanish"]
 
     async def test_baseline_is_prepended_by_default_with_same_seed_population(
         self, mock_objective_target, mock_adversarial_chat, mock_objective_scorer, mock_memory_seed_groups
@@ -400,8 +470,8 @@ class TestMultilingual:
             patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
             patch.object(
                 memory,
-                "update_scenario_run_state",
-                wraps=memory.update_scenario_run_state,
+                "update_scenario_run_state_async",
+                wraps=memory.update_scenario_run_state_async,
             ) as update_state,
         ):
             await scenario.initialize_async()
@@ -448,7 +518,7 @@ class TestMultilingual:
             awaited.kwargs["message"].get_value() for awaited in mock_objective_target.send_prompt_async.await_args_list
         ] == ["objectif traduit en francais", "objetivo traducido al espanol"]
         assert sleep_mock.await_args_list == [call(1.0), call(2.0)]
-        persisted_results = memory.get_attack_results(scenario_result_id=scenario._scenario_result_id)
+        persisted_results = await memory.get_attack_results_async(scenario_result_id=scenario._scenario_result_id)
         assert len(persisted_results) == 3
         observed_states = [call.kwargs["scenario_run_state"] for call in update_state.call_args_list]
         assert observed_states == [
@@ -456,3 +526,38 @@ class TestMultilingual:
             ScenarioRunState.IN_PROGRESS,
             ScenarioRunState.COMPLETED,
         ]
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {},
+            {"num_languages": 3},
+            {"languages": ["French", "german", "French"]},
+            {"languages": ["French", "German"], "translation_strategies": [_TRANSLATION]},
+            {"languages": ["French", "German"], "translation_strategies": [_RANDOM_TRANSLATION]},
+            {"languages": ["French"], "include_baseline": False},
+            {"scenario_techniques": ["prompt_sending", "base64"]},
+        ],
+    )
+    async def test_run_size_estimate_matches_the_initialized_run_async(
+        self,
+        *,
+        params: dict[str, Any],
+        mock_objective_target: PromptTarget,
+        mock_adversarial_chat: PromptTarget,
+        mock_objective_scorer: TrueFalseScorer,
+    ) -> None:
+        seed_groups = [AttackSeedGroup(seeds=[SeedObjective(value=f"objective {index}")]) for index in range(5)]
+        technique_class = _build_multilingual_technique()
+        if "scenario_techniques" in params:
+            params = {
+                **params,
+                "scenario_techniques": [technique_class(name) for name in params["scenario_techniques"]],
+            }
+        with _patch_seed_groups(seed_groups):
+            scenario = Multilingual(adversarial_chat=mock_adversarial_chat, objective_scorer=mock_objective_scorer)
+            scenario.set_params_from_args(args={"objective_target": mock_objective_target, **params})
+            estimate = await scenario.get_run_size_estimate_async(target_is_configured=True)
+            await scenario.initialize_async()
+
+        assert estimate.estimated_attack_count == sum(len(attack.seed_groups) for attack in scenario._atomic_attacks)

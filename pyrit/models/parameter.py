@@ -8,12 +8,23 @@ from __future__ import annotations
 import copy
 import types
 from abc import ABC, abstractmethod
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    TypeAdapter,
+    ValidationError,
+    computed_field,
+    field_serializer,
+    model_validator,
+)
 
 from pyrit.common.apply_defaults import REQUIRED_VALUE
 
@@ -84,9 +95,10 @@ class Parameter(BaseModel):
     value's live Python type and its allowed set (a ``Literal[...]`` or ``Enum``
     *is* the allowed set) and drives ``coerce_value`` / ``validate``; it is **not**
     serialized. Serialization instead projects the type into the display fields
-    ``type_name``, ``choices``, and ``is_list`` (plus ``required`` from the
-    ``REQUIRED_VALUE`` sentinel), so a consumer can rebuild a usable contract from
-    the registry without the live type travelling on the wire.
+    ``type_name``, ``choices``, ``is_list``, ``sensitive``, ``multiline``, and
+    ``identity_conflicting`` (plus ``required`` from the ``REQUIRED_VALUE``
+    sentinel), so a consumer can rebuild a usable contract from the registry
+    without the live type travelling on the wire.
 
     ``reference``, when set, marks the parameter as a registry reference: its value
     is supplied *by name* and resolved to a registered instance by the registry
@@ -95,8 +107,9 @@ class Parameter(BaseModel):
     while ``type_name`` and ``is_list`` expose whether clients supply one name or a
     list of names.
 
-    ``coerce_value`` and ``validate`` are the only public behaviors; all coercion
-    branching lives behind them so callers never touch a free function.
+    Coercion, strict supplied-value checks, and scalar JSON projection live here.
+    ``validate`` checks declarations; ``validate_value`` checks an existing value,
+    while ``validate_json_value`` applies the opt-in strict external-input contract.
     """
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
@@ -123,6 +136,18 @@ class Parameter(BaseModel):
     variants: dict[str, list[Parameter]] | None = Field(
         default=None,
         description="Named structured-input variants and their constructor parameters, supplied by the registry.",
+    )
+    sensitive: bool = Field(
+        default=False,
+        description="Whether user interfaces must obscure this parameter's value.",
+    )
+    multiline: bool = Field(
+        default=False,
+        description="Whether user interfaces must preserve line breaks in this parameter's value.",
+    )
+    identity_conflicting: bool = Field(
+        default=False,
+        description="Whether this parameter must be omitted when identity-based authentication is selected.",
     )
     destination: ParameterDestination = Field(
         default=ParameterDestination.CONSTRUCTOR,
@@ -264,6 +289,65 @@ class Parameter(BaseModel):
             return False
         return _is_scalar_param_type(_unwrap_optional(self.param_type))
 
+    @property
+    def is_external_input(self) -> bool:
+        """
+        Whether REST, CLI, and GUI callers may supply this parameter.
+
+        True for registry references, declared structured inputs, scalars (``Path`` and
+        ``Path | str`` included), flat ``list`` / ``Collection`` / ``Sequence`` of non-path
+        scalars, and other unions with one of those as an alternative and no path
+        alternative. External callers supply that
+        alternative, as for ``api_key: str | Callable[...]`` or
+        ``font_size: int | tuple[int, int]``; the other alternatives are for in-process
+        callers. Other parameters take Python objects from in-process callers only.
+
+        Returns:
+            bool: True when external callers may supply this parameter.
+        """
+        if self.reference is not None or self.variants is not None:
+            return True
+        if self.opaque:
+            return False
+        param_type = _unwrap_optional(self.param_type)
+        if _is_scalar_param_type(param_type):
+            return True
+        if get_origin(param_type) in (Union, types.UnionType):
+            members = [member for member in get_args(param_type) if member is not type(None)]
+            return not any(_mentions_path(member) for member in members) and any(
+                _is_non_path_json_type(member) for member in members
+            )
+        return _is_non_path_json_type(param_type)
+
+    def for_external_catalog(self) -> Parameter:
+        """
+        Describe this parameter in the form external callers send it.
+
+        A flat ``Collection`` or ``Sequence`` is described as a ``list``, and a union as its first
+        alternative in declaration order that external callers can send, so
+        ``font_size: int | tuple[int, int]`` is described as ``int``; ``Path | str`` keeps its own
+        form. Other alternatives are still accepted and coercion is unchanged; only the
+        catalog description changes, and registry metadata keeps the full annotation. A default the
+        described form cannot hold is left out, so callers omit the value and the constructor
+        default applies.
+
+        Returns:
+            Parameter: This parameter, or a copy whose ``param_type`` is the external form.
+        """
+        if self.reference is not None or self.variants is not None or self.opaque:
+            return self
+        external_type = _external_input_type(self.param_type)
+        if external_type == self.param_type:
+            return self
+        described = self.model_copy(update={"param_type": external_type})
+        if self.default is None or self.default is REQUIRED_VALUE:
+            return described
+        try:
+            described.coerce_value(self.default)
+        except ValueError:
+            return described.model_copy(update={"default": None})
+        return described
+
     def is_reference_to(self, component_type: ComponentType) -> bool:
         """
         Whether this parameter is a registry reference to the given component family.
@@ -280,6 +364,63 @@ class Parameter(BaseModel):
             bool: True when this parameter is a reference to ``component_type``.
         """
         return self.reference is not None and self.reference.component_type is component_type
+
+    @property
+    def is_json_input(self) -> bool:
+        """Whether strict JSON callers can supply this declared scalar, list, reference, or variant."""
+        if self.opaque:
+            return False
+        if self.reference is not None or self.variants is not None:
+            return True
+        annotation = _unwrap_optional(self.param_type)
+        if get_origin(annotation) is list:
+            annotation = get_args(annotation)[0] if get_args(annotation) else None
+        return annotation in (str, int, float, bool) or bool(self.choices)
+
+    def validate_json_value(self, value: Any) -> Any:
+        """
+        Validate a supplied JSON value without enabling CLI-style scalar coercion.
+
+        Enum names and values retain their declared coercion. Structured values are
+        validated recursively by registry resolution, not by this lightweight model.
+
+        Returns:
+            Any: The validated value, with constrained scalars converted to their declared members.
+
+        Raises:
+            ValueError: If this parameter requires a Python object or the JSON type is invalid.
+        """
+        if not self.is_json_input:
+            raise ValueError(f"Parameter '{self.name}' requires a Python value; it is not supported through REST")
+        TypeAdapter(JsonValue).validate_python(value, strict=True)
+        if self.variants is not None:
+            return value
+        if self.reference is not None:
+            annotation = list[str] if self.is_list else str
+            if type(None) in get_args(self.reference.annotation):
+                annotation = annotation | None
+            return TypeAdapter(annotation).validate_python(value, strict=True)
+        if self.choices:
+            value = self.coerce_value(value)
+        return TypeAdapter(self.param_type).validate_python(value, strict=True)
+
+    def project_json_value(self, value: Any) -> JsonValue:
+        """
+        Project a scalar source value without reconstructing opaque or structured state.
+
+        Returns:
+            JsonValue: A lossless JSON-native value for a supported scalar or list.
+
+        Raises:
+            ValueError: If the source requires a structured or Python-only representation.
+        """
+        if self.reference is not None or self.variants is not None or not self.is_json_input:
+            raise ValueError(f"Parameter '{self.name}' has no lossless scalar JSON projection")
+        if isinstance(value, Enum):
+            value = value.value
+        if isinstance(value, list):
+            value = [item.value if isinstance(item, Enum) else item for item in value]
+        return TypeAdapter(JsonValue).validate_python(value, strict=True)
 
     def coerce_value(self, raw_value: Any) -> Any:
         """
@@ -317,6 +458,24 @@ class Parameter(BaseModel):
         if _is_scalar_param_type(param_type):
             return _coerce_simple_value(param_name=self.name, annotation=param_type, raw_value=raw_value)
         return raw_value
+
+    def validate_value(self, value: Any) -> None:
+        """
+        Check a resolved scalar or list without coercing or replacing it.
+
+        Args:
+            value (Any): The resolved parameter value.
+
+        Raises:
+            ValueError: If the value does not match its declared type or choices.
+        """
+        if self.reference is not None or self.opaque:
+            return
+        if self.is_string_coercible or self.is_list:
+            try:
+                TypeAdapter(self.param_type).validate_python(value, strict=True)
+            except ValidationError as exc:
+                raise ValueError(f"Parameter '{self.name}' expects {self.type_name}: {exc}") from exc
 
     def validate(self) -> None:  # type: ignore[ty:invalid-method-override]
         """
@@ -398,6 +557,58 @@ def _is_scalar_param_type(annotation: Any) -> bool:
     return _is_enum_type(annotation)
 
 
+def _is_non_path_json_type(annotation: Any) -> bool:
+    """
+    Return whether the annotation is a non-path scalar or a flat collection of one.
+
+    A flat collection is a ``list``, ``Collection``, or ``Sequence`` of a single non-path
+    scalar; external callers send it as a JSON array, which reaches the constructor as a list.
+
+    Returns:
+        bool: True for ``str``/``int``/``float``/``bool``/``Literal``/``Enum`` or a flat collection of them.
+    """
+    if get_origin(annotation) in (list, Collection, Sequence):
+        type_args = get_args(annotation)
+        annotation = type_args[0] if len(type_args) == 1 else None
+    return _is_scalar_param_type(annotation) and annotation is not Path and not _is_path_or_str(annotation)
+
+
+def _mentions_path(annotation: Any) -> bool:
+    """
+    Return whether the annotation is ``Path`` or has ``Path`` among its type arguments.
+
+    Returns:
+        bool: True when a value of this type may be a local file path.
+    """
+    return annotation is Path or any(_mentions_path(argument) for argument in get_args(annotation))
+
+
+def _external_input_type(annotation: Any) -> Any:
+    """
+    Return the form external callers send for an annotation.
+
+    A flat ``Collection`` or ``Sequence`` becomes a ``list``, and a union becomes its first
+    alternative external callers can send, keeping ``None`` when the union allows it.
+    ``Path | str`` and every other annotation are returned unchanged.
+
+    Returns:
+        Any: The external form of the annotation.
+    """
+    if _is_path_or_str(annotation):
+        return annotation
+    origin = get_origin(annotation)
+    if origin in (Union, types.UnionType):
+        members = get_args(annotation)
+        supported = next((member for member in members if _is_non_path_json_type(member)), None)
+        if supported is None:
+            return annotation
+        external = _external_input_type(supported)
+        return external | None if type(None) in members else external
+    if origin in (Collection, Sequence) and len(get_args(annotation)) == 1:
+        return list[get_args(annotation)[0]]  # ty: ignore[invalid-type-form]
+    return annotation
+
+
 def _coerce_simple_value(*, param_name: str, annotation: Any, raw_value: Any) -> Any:
     """
     Coerce ``raw_value`` to a scalar ``annotation`` — the shared coercion core.
@@ -474,24 +685,27 @@ def _coerce_enum(*, param_name: str, enum_type: type[Enum], raw_value: Any) -> A
 
 def _coerce_scalar(*, param_name: str, scalar_type: type, raw_value: Any) -> Any:
     """
-    Coerce ``raw_value`` to ``int`` or ``float`` while rejecting native ``bool`` inputs.
+    Coerce numbers, rejecting booleans and integer conversions that lose a fractional part.
 
     Returns:
         Any: The value coerced to ``scalar_type``.
 
     Raises:
-        ValueError: If ``raw_value`` is a native ``bool`` or cannot be coerced to ``scalar_type``.
+        ValueError: If conversion fails or an integer conversion would lose a fractional part.
     """
     if isinstance(raw_value, bool):
         raise ValueError(
             f"Parameter '{param_name}' expects {scalar_type.__name__} but received a bool ({raw_value!r})."
         )
     try:
-        return scalar_type(raw_value)
-    except (TypeError, ValueError) as exc:
+        result = scalar_type(raw_value)
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(
             f"Parameter '{param_name}' could not be coerced to {scalar_type.__name__}: {raw_value!r} ({exc})."
         ) from exc
+    if scalar_type is int and not isinstance(raw_value, (str, bytes, bytearray)) and result != raw_value:
+        raise ValueError(f"Parameter '{param_name}' expects an integer without a fractional part, got {raw_value!r}.")
+    return result
 
 
 def _coerce_bool(*, param_name: str, raw_value: Any) -> bool:

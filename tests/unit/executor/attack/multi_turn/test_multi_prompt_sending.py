@@ -1,14 +1,23 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
+import codecs
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from unit.mocks import MockPromptTarget, get_mock_prompt_normalizer
 
-from pyrit.converter import Base64Converter, StringJoinConverter
+from pyrit.converter import (
+    Base64Converter,
+    ROT13Converter,
+    SelectiveTextConverter,
+    StringJoinConverter,
+    TokenSelectionStrategy,
+)
 from pyrit.executor.attack import (
     AttackConverterConfig,
+    AttackExecutor,
     AttackScoringConfig,
     ConversationSession,
     ConversationState,
@@ -24,11 +33,14 @@ from pyrit.message_normalizer import HistorySquashNormalizer, MessageStringNorma
 from pyrit.models import (
     AttackOutcome,
     AttackResult,
+    AttackSeedGroup,
     ComponentIdentifier,
     Message,
     MessagePiece,
     Score,
     ScoringExpectation,
+    SeedObjective,
+    SeedPrompt,
 )
 from pyrit.prompt_normalizer import ConverterConfiguration, PromptNormalizer
 from pyrit.prompt_target import (
@@ -38,6 +50,38 @@ from pyrit.prompt_target import (
     TargetConfiguration,
 )
 from pyrit.score import Scorer, TrueFalseScorer
+
+
+@pytest.mark.usefixtures("patch_central_database")
+@pytest.mark.parametrize(("start_token", "end_token"), [("⟪", "⟫"), ("<<", ">>")])
+@pytest.mark.parametrize("preserve_tokens", [False, True])
+async def test_attack_marker_pipelines_cover_multiple_messages_async(
+    *, start_token: str, end_token: str, preserve_tokens: bool
+) -> None:
+    target = MockPromptTarget()
+    selected = SelectiveTextConverter(
+        sub_converter=Base64Converter(),
+        selection_strategy=TokenSelectionStrategy(),
+        preserve_tokens=preserve_tokens,
+        start_token=start_token,
+        end_token=end_token,
+    )
+    attack = MultiPromptSendingAttack(
+        objective_target=target,
+        attack_converter_config=AttackConverterConfig(
+            request_converters=ConverterConfiguration.from_converters(converters=[selected, ROT13Converter()])
+        ),
+        prompt_normalizer=PromptNormalizer(start_token=start_token, end_token=end_token),
+    )
+    messages = [
+        Message.from_prompt(prompt=f"First: {start_token}{start_token}test{end_token}{end_token}", role="user"),
+        Message.from_prompt(prompt=f"Second: {start_token}{start_token}test2{end_token}{end_token}", role="user"),
+    ]
+    result = await attack.execute_async(objective="Test objective", user_messages=messages)
+    encoded = [codecs.encode(value, "rot_13") for value in ("dGVzdA==", "dGVzdDI=")]
+    expected = [f"{start_token}{value}{end_token}" if preserve_tokens else value for value in encoded]
+    assert target.prompt_sent == [f"First: {expected[0]}", f"Second: {expected[1]}"]
+    assert result.executed_turns == 2
 
 
 def _mock_scorer_id(name: str = "MockScorer") -> ComponentIdentifier:
@@ -85,7 +129,7 @@ def mock_non_true_false_scorer():
 @pytest.fixture
 def mock_prompt_normalizer():
     """Create a mock prompt normalizer for testing"""
-    normalizer = MagicMock(spec=PromptNormalizer)
+    normalizer = get_mock_prompt_normalizer()
     normalizer.send_prompt_async = AsyncMock()
     return normalizer
 
@@ -748,3 +792,54 @@ class TestEdgeCasesAndErrorHandling:
         # Should complete without error
         await attack._teardown_async(context=basic_context)
         # No assertions needed - we just want to ensure it runs without exceptions
+
+
+class TestUserMessageReuse:
+    """Caller-provided user_messages must be reusable across executions."""
+
+    async def test_execute_async_twice_with_same_user_messages(self, sqlite_instance):
+        target = MockPromptTarget()
+        attack = MultiPromptSendingAttack(objective_target=target)
+        user_messages = [
+            Message.from_prompt(prompt="turn one", role="user"),
+            Message.from_prompt(prompt="turn two", role="user"),
+        ]
+        original_ids = [piece.id for message in user_messages for piece in message.message_pieces]
+
+        first = await attack.execute_async(objective="objective one", user_messages=user_messages)
+        second = await attack.execute_async(objective="objective two", user_messages=user_messages)
+
+        assert first.conversation_id != second.conversation_id
+        for result in (first, second):
+            conversation = await sqlite_instance.get_conversation_messages_async(conversation_id=result.conversation_id)
+            assert [message.get_value() for message in conversation] == ["turn one", "default", "turn two", "default"]
+        # The caller's messages are left untouched.
+        assert [piece.id for message in user_messages for piece in message.message_pieces] == original_ids
+
+    async def test_executor_broadcasts_user_messages_to_all_objectives(self, sqlite_instance):
+        attack = MultiPromptSendingAttack(objective_target=MockPromptTarget())
+        user_messages = [Message.from_prompt(prompt="shared turn", role="user")]
+
+        result = await AttackExecutor(max_concurrency=2).execute_attack_async(
+            attack=attack,
+            objectives=["objective one", "objective two"],
+            user_messages=user_messages,
+            return_partial_on_failure=True,
+        )
+
+        assert result.incomplete_objectives == []
+        assert len(result.completed_results) == 2
+
+
+class TestFromSeedGroup:
+    async def test_from_seed_group_keeps_targeted_harm_categories(self):
+        seed_group = AttackSeedGroup(
+            seeds=[
+                SeedObjective(value="objective", harm_categories=["violence"]),
+                SeedPrompt(value="turn one", data_type="text", role="user", sequence=0),
+            ]
+        )
+
+        params = await MultiPromptSendingAttackParameters.from_seed_group_async(seed_group=seed_group)
+
+        assert params.targeted_harm_categories == ["violence"]

@@ -3,7 +3,21 @@ import { mobileTouchTarget, NARROW_VIEWPORT_QUERY } from '../../styles/touchTarg
 
 import { WORKSPACE_CANVAS_BACKGROUND } from '@/styles/workspaceBackground'
 
+export const CHAT_NOTICE_FADE_DURATION_MS = 200
+
 export const useChatWindowStyles = makeStyles({
+  infoNotice: {
+    opacity: 1,
+    transitionProperty: 'opacity',
+    transitionDuration: `${CHAT_NOTICE_FADE_DURATION_MS}ms`,
+    transitionTimingFunction: 'ease-out',
+    '@media (prefers-reduced-motion: reduce)': {
+      transitionDuration: '0ms',
+    },
+  },
+  fadingInfoNotice: {
+    opacity: 0,
+  },
   root: {
     display: 'flex',
     height: '100%',
@@ -62,8 +76,8 @@ export const useChatWindowStyles = makeStyles({
     maxWidth: '100vw',
   },
   ribbon: {
-    height: '48px',
     minHeight: '48px',
+    flexWrap: 'wrap',
     flexShrink: 0,
     backgroundColor: tokens.colorNeutralBackground3,
     borderBottom: `1px solid ${tokens.colorNeutralStroke1}`,
@@ -79,24 +93,51 @@ export const useChatWindowStyles = makeStyles({
     gap: tokens.spacingHorizontalS,
     color: tokens.colorNeutralForeground2,
     fontSize: tokens.fontSizeBase300,
-    flex: '1 1 auto',
+    flex: '0 1 auto',
     minWidth: 0,
     overflow: 'hidden',
   },
   sharedToolbar: {
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'flex-end',
+    justifyContent: 'space-between',
+    flexGrow: 1,
     flexWrap: 'wrap',
     gap: tokens.spacingHorizontalM,
+    minWidth: 0,
     maxWidth: '100%',
+  },
+  conversationControls: {
+    display: 'flex',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: tokens.spacingHorizontalM,
+    marginRight: 'auto',
+    minWidth: 0,
+    maxWidth: '100%',
+  },
+  editActions: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: tokens.spacingHorizontalXS,
+  },
+  temperatureField: {
+    gridTemplateColumns: 'max-content 5rem',
+    columnGap: tokens.spacingHorizontalNone,
+    alignItems: 'center',
+    flexShrink: 0,
+  },
+  temperatureInput: {
+    width: '5rem',
+    minWidth: 0,
   },
   sharedTarget: {
     maxWidth: '240px',
     [NARROW_VIEWPORT_QUERY]: {
       flexBasis: '100%',
       maxWidth: '100%',
-      justifyContent: 'flex-end',
+      justifyContent: 'flex-start',
     },
   },
   noTarget: {
@@ -115,6 +156,7 @@ export const useChatWindowStyles = makeStyles({
     flexWrap: 'wrap',
     justifyContent: 'flex-end',
     minWidth: 0,
+    marginLeft: 'auto',
   },
   ribbonAction: {
     ...mobileTouchTarget,

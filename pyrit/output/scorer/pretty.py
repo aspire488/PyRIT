@@ -8,7 +8,12 @@ from colorama import Fore, Style
 from pyrit.models import ComponentIdentifier, ScorerIdentifier, project_behavioral_identity
 from pyrit.output._formatting import _PrettyPrinterMixin
 from pyrit.output.scorer.base import ScorerPrinterBase
+from pyrit.output.scorer.json import format_scorer_type
 from pyrit.output.sink import Sink
+
+# The evaluator zeroes differences below this as floating-point noise, so a scorer whose MAE
+# matches the constant-guess baseline to within it is treated as a tie, not as beating it.
+_BASELINE_TIE_TOLERANCE = 1e-10
 
 
 class PrettyScorerPrinter(_PrettyPrinterMixin, ScorerPrinterBase):
@@ -66,6 +71,16 @@ class PrettyScorerPrinter(_PrettyPrinterMixin, ScorerPrinterBase):
             return str(Fore.RED)
         return str(Fore.CYAN)
 
+    def _render_scored_responses(self, *, metrics: Any) -> str:
+        if not metrics.num_input_responses:
+            return ""
+        coverage = metrics.num_responses / metrics.num_input_responses
+        return self._format_colored(
+            f"{self._indent * 3}• Scored Responses: {metrics.num_responses}/{metrics.num_input_responses}"
+            f" ({coverage:.1%} coverage)",
+            Fore.CYAN,
+        )
+
     def _render_scorer_info(
         self,
         scorer_identifier: ComponentIdentifier,
@@ -87,7 +102,7 @@ class PrettyScorerPrinter(_PrettyPrinterMixin, ScorerPrinterBase):
         lines: list[str] = []
         indent = self._indent * indent_level
 
-        lines.append(self._format_colored(f"{indent}• {label}: {scorer_identifier.class_name}", Fore.CYAN))
+        lines.append(self._format_colored(f"{indent}• {label}: {format_scorer_type(scorer_identifier)}", Fore.CYAN))
         if scorer_identifier.params:
             summary = self._summarize_params(
                 params=scorer_identifier.params,
@@ -163,6 +178,8 @@ class PrettyScorerPrinter(_PrettyPrinterMixin, ScorerPrinterBase):
         )
         lines.append(self._format_colored(f"{self._indent * 3}• Accuracy: {metrics.accuracy:.2%}", accuracy_color))
 
+        lines.append(self._render_scored_responses(metrics=metrics))
+
         if metrics.accuracy_standard_error is not None:
             lines.append(
                 self._format_colored(
@@ -237,9 +254,43 @@ class PrettyScorerPrinter(_PrettyPrinterMixin, ScorerPrinterBase):
             )
         )
 
+        lines.append(self._render_scored_responses(metrics=metrics))
+
         if metrics.mae_standard_error is not None:
             lines.append(
                 self._format_colored(f"{self._indent * 3}• MAE Std Error: ±{metrics.mae_standard_error:.4f}", Fore.CYAN)
+            )
+
+        if metrics.mean_absolute_error_unanimous is not None:
+            lines.append(
+                self._format_colored(
+                    f"{self._indent * 3}• MAE on unanimous rows: {metrics.mean_absolute_error_unanimous:.4f}"
+                    f" (n={metrics.num_unanimous_responses})",
+                    Fore.CYAN,
+                )
+            )
+
+        if metrics.mean_absolute_error_contested is not None:
+            contested_color = self._get_quality_color(
+                metrics.mean_absolute_error_contested, higher_is_better=False, good_threshold=0.1, bad_threshold=0.25
+            )
+            lines.append(
+                self._format_colored(
+                    f"{self._indent * 3}• MAE on contested rows: {metrics.mean_absolute_error_contested:.4f}"
+                    f" (n={metrics.num_contested_responses})",
+                    contested_color,
+                )
+            )
+
+        baseline_mae = getattr(metrics, "baseline_mean_absolute_error", None)
+        if baseline_mae is not None:
+            beats_baseline = metrics.mean_absolute_error < baseline_mae - _BASELINE_TIE_TOLERANCE
+            lines.append(
+                self._format_colored(
+                    f"{self._indent * 3}• Constant-Guess Baseline MAE: {baseline_mae:.4f}"
+                    + ("" if beats_baseline else " (scorer does not beat it)"),
+                    Fore.CYAN if beats_baseline else Fore.RED,
+                )
             )
 
         if metrics.krippendorff_alpha_combined is not None:

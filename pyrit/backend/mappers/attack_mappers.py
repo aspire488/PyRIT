@@ -11,13 +11,12 @@ constructs local media endpoint URLs for media content.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 from urllib.parse import quote, urlparse
 
 from azure.identity.aio import DefaultAzureCredential
@@ -33,6 +32,12 @@ from pyrit.backend.models.attacks import (
     MessageView,
     ScoreView,
 )
+from pyrit.backend.services.media_persistence import (
+    MediaAccessDeniedError,
+    results_container_url,
+    validate_blob_media_url,
+)
+from pyrit.common.azure_storage import redact_url_credentials
 from pyrit.memory import CentralMemory
 from pyrit.models import (
     MEDIA_PATH_DATA_TYPES,
@@ -40,7 +45,6 @@ from pyrit.models import (
     ChatMessageRole,
     Message,
     MessagePiece,
-    PromptDataType,
     Score,
 )
 
@@ -50,6 +54,7 @@ _LEGACY_MANUAL_ATTACK_PLACEHOLDER = "Manual attack via GUI"
 
 if TYPE_CHECKING:
     from pyrit.models.conversation_stats import ConversationStats
+    from pyrit.models.results.attack_result import AttackScoringInputs
 
 # ============================================================================
 # Domain → DTO  (for API responses)
@@ -125,18 +130,28 @@ async def _get_sas_for_container_async(*, container_url: str) -> str:
 
 async def _sign_blob_url_async(*, blob_url: str) -> str:
     """
-    Append a read-only SAS token to an Azure Blob Storage URL.
+    Append a read-only SAS token to an Azure Blob Storage URL in the results container.
 
-    Non-blob URLs (local paths, data URIs, etc.) are returned unchanged.
+    Non-blob URLs (local paths, data URIs, etc.) and blob URLs outside the media
+    subdirectories of the results container are returned unchanged, so the server
+    only signs the result media it manages.
 
     Args:
         blob_url: The raw Azure Blob Storage URL.
 
     Returns:
         The URL with an appended SAS query string, or the original value for
-        non-blob URLs.
+        other URLs.
     """
     if not _is_azure_blob_url(blob_url):
+        return blob_url
+    results_container = results_container_url()
+    if results_container is None:
+        return blob_url
+    try:
+        validate_blob_media_url(url=blob_url, container_url=results_container)
+    except MediaAccessDeniedError:
+        logger.debug("Not signing a blob URL outside the results container: %s", redact_url_credentials(blob_url))
         return blob_url
 
     parsed = urlparse(blob_url)
@@ -208,6 +223,9 @@ async def attack_result_to_summary_async(
     ar: AttackResult,
     *,
     stats: ConversationStats,
+    operation_name: str | None = None,
+    scoring_inputs: AttackScoringInputs | None = None,
+    execution_read_only: bool = False,
 ) -> AttackSummary:
     """
     Build an AttackSummary view from an AttackResult.
@@ -220,6 +238,10 @@ async def attack_result_to_summary_async(
     Args:
         ar: The domain AttackResult.
         stats: Pre-aggregated conversation stats (from ``get_conversation_stats``).
+        operation_name: The current name of the saved Operation, when the attack has one.
+            Legacy attacks without an Operation ID show their historical name instead.
+        scoring_inputs: Effective inputs resolved against the current registry by the service.
+        execution_read_only: Whether execution changes require a manual continuation.
 
     Returns:
         AttackSummary view ready for the API response.
@@ -233,12 +255,16 @@ async def attack_result_to_summary_async(
     data = {name: getattr(ar, name) for name in AttackResult.model_fields}
     data.update(
         objective=_normalize_summary_objective(ar),
+        chat_scorer=scoring_inputs.scorer if scoring_inputs else None,
+        chat_scorer_inherited=scoring_inputs.inherited if scoring_inputs else False,
+        execution_read_only=execution_read_only,
         last_response=await _summary_last_response_async(ar.last_response),
         automated_score=(
             ScoreView.from_domain(ar.automated_score, is_objective_score=True) if ar.automated_score else None
         ),
         human_score=ScoreView.from_domain(ar.human_score, is_objective_score=True) if ar.human_score else None,
         labels=labels,
+        operation_name=operation_name if ar.operation_id is not None else ar.operation,
         message_count=stats.message_count,
         last_message_preview=format_last_message_preview(
             value=stats.last_message_preview,
@@ -314,6 +340,25 @@ async def _resolve_and_sign_media_async(*, value: str | None, data_type: str) ->
     return resolved
 
 
+async def resolve_client_media_url_async(*, value: str | None, data_type: str) -> str | None:
+    """
+    Resolve a stored media value to a client-fetchable display URL.
+
+    This is the shared mapper for chat messages and dataset seed details.
+    Local files that exist become ``/api/media`` URLs. Azure Blob URLs are
+    signed. Data URIs and other HTTP URLs pass through. The stored value is
+    not modified; callers keep it as the stable source reference.
+
+    Args:
+        value: The stored file path, blob URL, data URI, or text.
+        data_type: The prompt data type (for example ``image_path`` or ``text``).
+
+    Returns:
+        The display URL, or ``None`` when the value is empty or not media.
+    """
+    return await _resolve_and_sign_media_async(value=value, data_type=data_type)
+
+
 def _score_lookup_key(*, piece: MessagePiece) -> str:
     """
     Compute the score-lookup key for a piece.
@@ -346,7 +391,7 @@ async def _fetch_scores_by_piece_async(
         return {}
 
     memory = CentralMemory.get_memory_instance()
-    fetched = await asyncio.to_thread(memory.get_prompt_scores, prompt_ids=score_lookup_ids)
+    fetched = await memory.get_prompt_scores_async(prompt_ids=score_lookup_ids)
 
     grouped: dict[str, list[Score]] = {}
     for score in fetched:
@@ -436,9 +481,9 @@ def request_piece_to_pyrit_message_piece(
     return MessagePiece(
         role=role,
         original_value=piece.original_value,
-        original_value_data_type=cast("PromptDataType", piece.data_type),
-        converted_value=piece.converted_value or piece.original_value,
-        converted_value_data_type=cast("PromptDataType", piece.data_type),
+        original_value_data_type=piece.data_type,
+        converted_value=piece.converted_value if piece.converted_value is not None else piece.original_value,
+        converted_value_data_type=piece.converted_value_data_type or piece.data_type,
         conversation_id=conversation_id,
         sequence=sequence,
         prompt_metadata=metadata,

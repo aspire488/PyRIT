@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { type MouseEvent, useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   Badge,
@@ -23,14 +23,19 @@ import {
   ArrowRightRegular,
   ArrowSyncRegular,
   FilterDismissRegular,
+  PlayRegular,
   ScriptRegular,
 } from '@fluentui/react-icons'
 
 import { useScenarioQueue } from '@/hooks/useScenarioQueue'
-import { labelsApi, scenariosApi } from '@/services/api'
+import { useScenarioRunResume } from '@/hooks/useScenarioRunResume'
+import { labelsApi, operationsApi, scenariosApi } from '@/services/api'
 import { toApiError } from '@/services/errors'
-import type { ScenarioQueueSnapshot, ScenarioRunListItem, ScenarioRunState } from '@/types'
+import type {
+  FilterOption, ScenarioQueueSnapshot, ScenarioRunListItem, ScenarioRunState, ScenarioRunSummary,
+} from '@/types'
 import { fetchAllPages } from '@/utils/fetchAllPages'
+import SearchableMultiCombobox from '@/components/SearchableMultiCombobox'
 
 import type { ViewName } from '../Sidebar/Navigation'
 import { useScenarioHistoryStyles } from './ScenarioHistory.styles'
@@ -101,7 +106,7 @@ export default function ScenarioHistory({
   const [optionsError, setOptionsError] = useState<string | null>(null)
   const [scenarioOptions, setScenarioOptions] = useState<string[]>([])
   const [operatorOptions, setOperatorOptions] = useState<string[]>([])
-  const [operationOptions, setOperationOptions] = useState<string[]>([])
+  const [operationOptions, setOperationOptions] = useState<FilterOption[]>([])
   const [otherLabelOptions, setOtherLabelOptions] = useState<string[]>([])
   const [page, setPage] = useState(0)
   const [nextCursor, setNextCursor] = useState<string | undefined>()
@@ -111,7 +116,7 @@ export default function ScenarioHistory({
     filters.scenarioNames,
     filters.statuses,
     filters.operator,
-    filters.operation,
+    filters.operationId,
     filters.otherLabels,
   ])
   const [settledFilterKey, setSettledFilterKey] = useState<string | null>(null)
@@ -127,13 +132,27 @@ export default function ScenarioHistory({
     setError(null)
     setFetchToken((previous) => ({ cursor, filterKey, nonce: previous.nonce + 1 }))
   }, [filterKey])
+  const resume = useScenarioRunResume({
+    onResumed: (resumedRun: ScenarioRunSummary): void => {
+      setRuns((current: ScenarioRunListItem[]) => current.map((run: ScenarioRunListItem) =>
+        run.scenario_result_id === resumedRun.scenario_result_id
+          ? { ...run, status: resumedRun.status, completed_at: resumedRun.completed_at }
+          : run,
+      ))
+    },
+    onRefresh: (): void => {
+      requestPage(fetchToken.filterKey === filterKey ? fetchToken.cursor : undefined)
+      queue.retry()
+    },
+  })
 
   useEffect(() => {
     let cancelled = false
     Promise.allSettled([
       fetchAllPages((cursor) => scenariosApi.listCatalog(100, cursor)),
       labelsApi.getLabels('scenarios'),
-    ]).then(([catalogResult, labelsResult]) => {
+      operationsApi.list(),
+    ]).then(([catalogResult, labelsResult, operationsResult]) => {
       if (cancelled) return
       const failures: string[] = []
       if (catalogResult.status === 'fulfilled') {
@@ -143,15 +162,18 @@ export default function ScenarioHistory({
       }
       if (labelsResult.status === 'fulfilled') {
         const operators = labelsResult.value.labels.operator ?? []
-        const operations = labelsResult.value.labels.operation ?? []
         const others = Object.entries(labelsResult.value.labels)
           .filter(([key]) => key !== 'operator' && key !== 'operation' && key !== 'source')
           .flatMap(([key, values]) => values.map((value) => `${key}:${value}`))
         setOperatorOptions([...operators].sort())
-        setOperationOptions([...operations].sort())
         setOtherLabelOptions(others.sort())
       } else {
         failures.push('labels')
+      }
+      if (operationsResult.status === 'fulfilled') {
+        setOperationOptions(operationsResult.value.items.map(operation => ({ value: operation.id, label: operation.name })))
+      } else {
+        failures.push('operations')
       }
       setOptionsError(failures.length > 0 ? `Some filter options could not be loaded: ${failures.join(', ')}.` : null)
     })
@@ -171,7 +193,6 @@ export default function ScenarioHistory({
     const effectiveCursor = fetchToken.filterKey === filterKey ? fetchToken.cursor : undefined
     const label = [
       ...filters.operator.map((value) => `operator:${value}`),
-      ...filters.operation.map((value) => `operation:${value}`),
       ...filters.otherLabels,
     ]
     scenariosApi.listRuns({
@@ -180,6 +201,7 @@ export default function ScenarioHistory({
       scenario_names: filters.scenarioNames.length > 0 ? filters.scenarioNames : undefined,
       run_statuses: filters.statuses.length > 0 ? filters.statuses : undefined,
       label: label.length > 0 ? label : undefined,
+      operation_id: filters.operationId.length > 0 ? filters.operationId : undefined,
     }).then((response) => {
       if (cancelled) return
       setRuns(response.items)
@@ -209,7 +231,7 @@ export default function ScenarioHistory({
     filters.scenarioNames,
     filters.statuses,
     filters.operator,
-    filters.operation,
+    filters.operationId,
     filters.otherLabels,
   ])
 
@@ -231,7 +253,7 @@ export default function ScenarioHistory({
   const hasFilters = filters.scenarioNames.length > 0
     || filters.statuses.length > 0
     || filters.operator.length > 0
-    || filters.operation.length > 0
+    || filters.operationId.length > 0
     || filters.otherLabels.length > 0
   const filtersPending = settledFilterKey !== filterKey
   const displayLoading = loading || filtersPending
@@ -260,7 +282,7 @@ export default function ScenarioHistory({
               size="small"
               icon={<FilterDismissRegular />}
               aria-label="Reset all filters"
-              disabled={!hasFilters}
+              disabledFocusable={!hasFilters}
               onClick={() => onFiltersChange({ ...DEFAULT_SCENARIO_HISTORY_FILTERS })}
               data-testid="scenario-reset-filters-btn"
             />
@@ -292,12 +314,12 @@ export default function ScenarioHistory({
             testId="scenario-operator-filter"
             className={styles.filterDropdown}
           />
-          <MultiFilter
-            label="Operation"
+          <SearchableMultiCombobox
+            ariaLabel="Operation"
             placeholder="All operations"
-            selected={filters.operation}
+            selectedOptions={filters.operationId}
             options={operationOptions}
-            onSelect={(values) => setFilter('operation', values)}
+            onSelect={(values) => setFilter('operationId', values)}
             testId="scenario-operation-filter"
             className={styles.filterDropdown}
           />
@@ -314,6 +336,11 @@ export default function ScenarioHistory({
         {optionsError && (
           <MessageBar intent="warning">
             <MessageBarBody>{optionsError}</MessageBarBody>
+          </MessageBar>
+        )}
+        {(resume.error || resume.executionError) && (
+          <MessageBar intent="error">
+            <MessageBarBody>{resume.error || resume.executionError}</MessageBarBody>
           </MessageBar>
         )}
       </header>
@@ -343,6 +370,8 @@ export default function ScenarioHistory({
             runs={runs}
             queueSnapshot={queue.snapshot}
             onOpenRun={onOpenRun}
+            onResume={resume.requestResume}
+            resumingRunId={resume.pendingRunId}
             now={now}
           />
         )}
@@ -385,10 +414,14 @@ interface ScenarioHistoryTableProps {
   runs: ScenarioRunListItem[]
   queueSnapshot: ScenarioQueueSnapshot | null
   onOpenRun: (scenarioResultId: string) => void
+  onResume: (scenarioResultId: string) => void
+  resumingRunId: string | null
   now: number
 }
 
-function ScenarioHistoryTable({ runs, queueSnapshot, onOpenRun, now }: ScenarioHistoryTableProps) {
+function ScenarioHistoryTable({
+  runs, queueSnapshot, onOpenRun, onResume, resumingRunId, now,
+}: ScenarioHistoryTableProps) {
   const styles = useScenarioHistoryStyles()
   return (
     <Table className={styles.table} aria-label="Scanner history" data-testid="scenario-history-table">
@@ -396,23 +429,26 @@ function ScenarioHistoryTable({ runs, queueSnapshot, onOpenRun, now }: ScenarioH
         <TableRow>
           <TableHeaderCell>Scenario</TableHeaderCell>
           <TableHeaderCell>State</TableHeaderCell>
+          <TableHeaderCell>Operator</TableHeaderCell>
+          <TableHeaderCell>Operation</TableHeaderCell>
           <TableHeaderCell>Target</TableHeaderCell>
-          <TableHeaderCell>Created</TableHeaderCell>
-          <TableHeaderCell>Runtime</TableHeaderCell>
-          <TableHeaderCell>Attacks Complete</TableHeaderCell>
+          <TableHeaderCell>Timing</TableHeaderCell>
           <TableHeaderCell>Attack Success</TableHeaderCell>
           <TableHeaderCell>Errors / retries</TableHeaderCell>
           <TableHeaderCell>Labels</TableHeaderCell>
+          <TableHeaderCell>Actions</TableHeaderCell>
         </TableRow>
       </TableHeader>
       <TableBody>
-        {runs.map((run) => (
-          <TableRow
-            key={run.scenario_result_id}
-            className={styles.clickableRow}
-            data-testid={`scenario-history-row-${run.scenario_result_id}`}
-            onClick={() => onOpenRun(run.scenario_result_id)}
-          >
+        {runs.map((run) => {
+          const attackProgress = formatAttackProgress(run, queueSnapshot)
+          return (
+            <TableRow
+              key={run.scenario_result_id}
+              className={styles.clickableRow}
+              data-testid={`scenario-history-row-${run.scenario_result_id}`}
+              onClick={() => onOpenRun(run.scenario_result_id)}
+            >
             <TableCell>
               <a
                 href={`/scanner-history/${run.scenario_result_id}`}
@@ -438,7 +474,16 @@ function ScenarioHistoryTable({ runs, queueSnapshot, onOpenRun, now }: ScenarioH
                 </span>
               </a>
             </TableCell>
-            <TableCell><Badge appearance="outline">{formatHistoryState(run, queueSnapshot)}</Badge></TableCell>
+            <TableCell>
+              <div className={styles.stackedCell}>
+                <Badge appearance="outline">{formatHistoryState(run, queueSnapshot)}</Badge>
+                {attackProgress && (
+                  <Text size={200} className={styles.secondary}>{attackProgress}</Text>
+                )}
+              </div>
+            </TableCell>
+            <TableCell>{run.labels.operator ?? 'Unavailable'}</TableCell>
+            <TableCell>{run.operation_name ?? 'Unavailable'}</TableCell>
             <TableCell>
               {run.target ? (
                 <Tooltip content={run.target.endpoint ?? run.target.target_type} relationship="label">
@@ -451,14 +496,11 @@ function ScenarioHistoryTable({ runs, queueSnapshot, onOpenRun, now }: ScenarioH
                 </Tooltip>
               ) : 'Unavailable'}
             </TableCell>
-            <TableCell className={styles.nowrap}>{formatTimestamp(run.created_at)}</TableCell>
-            <TableCell className={styles.nowrap}>
-              {formatRuntime(run, now)}
-            </TableCell>
-            <TableCell className={styles.nowrap}>
-              {run.planned_total_available !== false && run.total_attacks !== null
-                ? `${run.completed_attacks}/${run.total_attacks}`
-                : `${run.completed_attacks} known / total unknown`}
+            <TableCell>
+              <div className={mergeClasses(styles.stackedCell, styles.nowrap)}>
+                <Text>{formatTimestamp(run.created_at)}</Text>
+                <Text size={200} className={styles.secondary}>{formatRuntime(run, now)}</Text>
+              </div>
             </TableCell>
             <TableCell className={styles.nowrap}>
               {formatSuccess(run)}
@@ -466,13 +508,33 @@ function ScenarioHistoryTable({ runs, queueSnapshot, onOpenRun, now }: ScenarioH
             <TableCell className={styles.nowrap}>{run.error_attacks} / {run.total_retries}</TableCell>
             <TableCell>
               <div className={styles.badges}>
-                {Object.entries(run.labels).map(([key, value]) => (
-                  <Badge key={key} appearance="tint" size="small">{key}: {value}</Badge>
-                ))}
+                {Object.entries(run.labels)
+                  .filter(([key]) => key !== 'operator' && key !== 'operation')
+                  .map(([key, value]) => (
+                    <Badge key={key} appearance="tint" size="small">{key}: {value}</Badge>
+                  ))}
               </div>
             </TableCell>
-          </TableRow>
-        ))}
+            <TableCell>
+              {run.status === 'FAILED' && (
+                <Button
+                  className={styles.touchTarget}
+                  icon={<PlayRegular />}
+                  disabled={resumingRunId !== null}
+                  aria-label={`Resume ${run.scenario_registry_name ?? run.scenario_name} run ${run.scenario_result_id}`}
+                  onClick={(event: MouseEvent<HTMLButtonElement>) => {
+                    event.stopPropagation()
+                    onResume(run.scenario_result_id)
+                  }}
+                  data-testid={`scenario-history-resume-${run.scenario_result_id}`}
+                >
+                  {resumingRunId === run.scenario_result_id ? 'Resuming...' : 'Resume'}
+                </Button>
+              )}
+            </TableCell>
+            </TableRow>
+          )
+        })}
       </TableBody>
     </Table>
   )
@@ -486,7 +548,7 @@ function formatHistoryState(run: ScenarioRunListItem, queueSnapshot: ScenarioQue
   if (isTerminal(run.status)) {
     return formatState(run.status)
   }
-  if (queueSnapshot?.active?.scenario_result_id === run.scenario_result_id) {
+  if (isRunInProgress(run, queueSnapshot)) {
     return 'In progress'
   }
   const position = queueSnapshot?.queued.find(
@@ -536,11 +598,40 @@ function formatRuntime(run: ScenarioRunListItem, now: number): string {
     : seconds < 3600
       ? `${Math.floor(seconds / 60)}m`
       : `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
-  return `${duration} (${terminal ? 'completed' : 'in progress'})`
+  return duration
 }
 
 function isTerminal(status: ScenarioRunState): boolean {
   return status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED'
+}
+
+function isRunInProgress(run: ScenarioRunListItem, queueSnapshot: ScenarioQueueSnapshot | null): boolean {
+  return run.status === 'IN_PROGRESS'
+    || queueSnapshot?.active?.scenario_result_id === run.scenario_result_id
+}
+
+function formatAttackProgress(
+  run: ScenarioRunListItem,
+  queueSnapshot: ScenarioQueueSnapshot | null,
+): string | null {
+  if (isTerminal(run.status)) {
+    return run.planned_total_available !== false
+      && run.total_attacks !== null
+      && run.completed_attacks !== run.total_attacks
+      ? `${run.completed_attacks}/${run.total_attacks} attacks complete`
+      : null
+  }
+  const inProgress = isRunInProgress(run, queueSnapshot)
+  if (run.planned_total_available === false || run.total_attacks === null) {
+    return inProgress
+      ? `${run.completed_attacks} complete / total unknown`
+      : 'Attack total unknown'
+  }
+  if (inProgress) {
+    return `${run.completed_attacks}/${run.total_attacks} attacks complete`
+  }
+  const attackLabel = run.total_attacks === 1 ? 'attack' : 'attacks'
+  return `${run.total_attacks} ${attackLabel} planned`
 }
 
 function formatSuccess(run: ScenarioRunListItem): string {

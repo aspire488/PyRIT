@@ -28,6 +28,7 @@ from pyrit.score.float_scale.float_scale_score_aggregator import (
 )
 from pyrit.score.float_scale.float_scale_scorer import MessageFloatScaleScorer
 from pyrit.score.scorer_prompt_validator import ScorerPromptValidator
+from pyrit.score.text_chunking import iter_chunk_spans
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -234,21 +235,6 @@ class AzureContentFilterScorer(MessageFloatScaleScorer):
             max_concurrency=max_concurrency,
         )
 
-    def _get_chunks(self, text: str) -> list[str]:
-        """
-        Split text into chunks that fit within MAX_TEXT_LENGTH.
-
-        Args:
-            text (str): The text to be chunked.
-
-        Returns:
-            list[str]: A list of text chunks, each with length <= MAX_TEXT_LENGTH.
-        """
-        if len(text) <= self.MAX_TEXT_LENGTH:
-            return [text]
-
-        return [text[i : i + self.MAX_TEXT_LENGTH] for i in range(0, len(text), self.MAX_TEXT_LENGTH)]
-
     async def _score_piece_async(self, message_piece: MessagePiece, *, objective: str | None = None) -> list[Score]:
         """
         Evaluate the input text or image using the Azure Content Filter API.
@@ -273,21 +259,19 @@ class AzureContentFilterScorer(MessageFloatScaleScorer):
         Raises:
             ValueError: If converted_value_data_type is not "text" or "image_path" or image isn't in supported format.
         """
-        filter_results: list[AnalyzeTextResult | AnalyzeImageResult] = []
+        filter_results: list[tuple[AnalyzeTextResult | AnalyzeImageResult, float]] = []
 
         if message_piece.converted_value_data_type == "text":
             text = message_piece.converted_value
-            chunks = self._get_chunks(text)
-
             # Analyze each chunk, because Azure Content Safety has a max text length limit
-            for chunk in chunks:
+            for start, end in iter_chunk_spans(length=len(text), chunk_length=self.MAX_TEXT_LENGTH):
                 text_request_options = AnalyzeTextOptions(
-                    text=chunk,
+                    text=text[start:end],
                     categories=self._category_values,
                     output_type="EightSeverityLevels",
                 )
                 text_result = await self._azure_cf_client.analyze_text(text_request_options)
-                filter_results.append(text_result)
+                filter_results.append((text_result, 7.0))
 
         elif message_piece.converted_value_data_type == "image_path":
             base64_encoded_data = await self._get_base64_image_data_async(message_piece)
@@ -297,15 +281,15 @@ class AzureContentFilterScorer(MessageFloatScaleScorer):
                 image=image_data, categories=self._category_values, output_type="FourSeverityLevels"
             )
             image_result = await self._azure_cf_client.analyze_image(image_request_options)
-            filter_results.append(image_result)
+            filter_results.append((image_result, 6.0))
 
         # Collect all scores from all chunks/images
         all_scores = []
-        for filter_result in filter_results:
+        for filter_result, severity_max in filter_results:
             for score in filter_result["categoriesAnalysis"]:
                 value = score["severity"]
                 category = score["category"]
-                normalized_value = self.scale_value_float(float(value), 0, 7)
+                normalized_value = self.scale_value_float(float(value), 0, severity_max)
 
                 # Severity as defined here
                 # https://learn.microsoft.com/en-us/azure/ai-services/content-safety/concepts/harm-categories?tabs=definitions#severity-levels

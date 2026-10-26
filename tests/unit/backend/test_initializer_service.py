@@ -5,6 +5,7 @@
 Tests for backend initializer service and routes.
 """
 
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -26,22 +27,22 @@ from pyrit.registry import InitializerMetadata
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client(compatibility_headers: dict[str, str]) -> Iterator[TestClient]:
     """Create a test client for the FastAPI app."""
     app.dependency_overrides[require_admin] = lambda: None
     try:
-        yield TestClient(app)
+        yield TestClient(app, headers=compatibility_headers)
     finally:
         app.dependency_overrides.pop(require_admin, None)
 
 
 @pytest.fixture
-def client_with_custom_initializers_enabled():
+def client_with_custom_initializers_enabled(compatibility_headers: dict[str, str]):
     """Create a test client with allow_custom_initializers enabled."""
     app.state.allow_custom_initializers = True
     app.dependency_overrides[require_admin] = lambda: None
     try:
-        yield TestClient(app)
+        yield TestClient(app, headers=compatibility_headers)
     finally:
         app.state.allow_custom_initializers = False
         app.dependency_overrides.pop(require_admin, None)
