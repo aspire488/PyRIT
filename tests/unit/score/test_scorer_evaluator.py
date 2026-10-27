@@ -231,9 +231,7 @@ def test_validate_and_extract_objective_data_rejects_invalid_assistant_count(
             f"but found {expected_count}"
         ),
     ):
-        ObjectiveScorerEvaluator(mock_objective_scorer)._validate_and_extract_data(
-            dataset
-        )
+        ObjectiveScorerEvaluator(mock_objective_scorer)._validate_and_extract_data(dataset)
 
     assert (
         mock_objective_scorer._memory.add_message_to_memory.call_count
