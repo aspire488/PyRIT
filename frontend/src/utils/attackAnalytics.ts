@@ -51,7 +51,8 @@ export const ANALYTICS_DIMENSIONS: Array<{ value: string; label: string; dimensi
   { value: 'scenario', label: 'Scenario run', dimension: { name: 'scenario' } },
 ]
 
-const PERCENT_FORMAT = new Intl.NumberFormat(undefined, { style: 'percent', maximumFractionDigits: 1 })
+// Analytics labels and tests must be stable across the host machine's locale.
+const PERCENT_FORMAT = new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 1 })
 const COUNT_FORMAT = new Intl.NumberFormat()
 const LABEL_KEY_PATTERN = /^[A-Za-z0-9_.-]{1,128}$/
 const AWARE_TIMESTAMP_PATTERN =
